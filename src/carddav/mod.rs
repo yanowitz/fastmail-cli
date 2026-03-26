@@ -104,16 +104,35 @@ impl CardDavClient {
     }
 
     fn parse_addressbooks_response(&self, xml: &str) -> Result<Vec<AddressBook>> {
+        let doc = roxmltree::Document::parse(xml)
+            .map_err(|e| Error::Server(format!("Failed to parse XML: {e}")))?;
+
+        let dav_ns = "DAV:";
+        let carddav_ns = "urn:ietf:params:xml:ns:carddav";
         let mut addressbooks = Vec::new();
 
-        // Simple XML parsing - look for response elements with addressbook resourcetype
-        for response in xml.split("<d:response>").skip(1) {
-            let href = extract_xml_value(response, "d:href").unwrap_or_default();
-            let displayname = extract_xml_value(response, "d:displayname");
+        for response in doc
+            .descendants()
+            .filter(|n| n.has_tag_name((dav_ns, "response")))
+        {
+            let href = response
+                .descendants()
+                .find(|n| n.has_tag_name((dav_ns, "href")))
+                .and_then(|n| n.text())
+                .unwrap_or_default();
 
             // Check if this is an addressbook (has carddav:addressbook resourcetype)
-            if response.contains("addressbook") && !href.is_empty() {
-                let name = displayname.unwrap_or_else(|| {
+            let is_addressbook = response
+                .descendants()
+                .any(|n| n.has_tag_name((carddav_ns, "addressbook")));
+
+            if is_addressbook && !href.is_empty() {
+                let displayname = response
+                    .descendants()
+                    .find(|n| n.has_tag_name((dav_ns, "displayname")))
+                    .and_then(|n| n.text());
+
+                let name = displayname.map(|s| s.to_string()).unwrap_or_else(|| {
                     href.split('/')
                         .rfind(|s| !s.is_empty())
                         .unwrap_or("Unknown")
@@ -122,7 +141,10 @@ impl CardDavClient {
 
                 // Skip the parent collection itself
                 if !href.ends_with(&format!("{}/", self.username)) {
-                    addressbooks.push(AddressBook { href, name });
+                    addressbooks.push(AddressBook {
+                        href: href.to_string(),
+                        name,
+                    });
                 }
             }
         }
@@ -169,26 +191,28 @@ impl CardDavClient {
     }
 
     fn parse_contacts_response(&self, xml: &str) -> Result<Vec<Contact>> {
+        let doc = roxmltree::Document::parse(xml)
+            .map_err(|e| Error::Server(format!("Failed to parse XML: {e}")))?;
+
+        let dav_ns = "DAV:";
+        let carddav_ns = "urn:ietf:params:xml:ns:carddav";
         let mut contacts = Vec::new();
 
-        for response in xml.split("<d:response>").skip(1) {
-            if let Some(vcard_data) = extract_xml_value(response, "card:address-data") {
-                // Unescape XML entities
-                let vcard_data = vcard_data
-                    .replace("&lt;", "<")
-                    .replace("&gt;", ">")
-                    .replace("&amp;", "&")
-                    .replace("&quot;", "\"");
-
-                if let Some(contact) = parse_vcard(&vcard_data) {
-                    contacts.push(contact);
-                }
+        for response in doc
+            .descendants()
+            .filter(|n| n.has_tag_name((dav_ns, "response")))
+        {
+            if let Some(vcard_data) = response
+                .descendants()
+                .find(|n| n.has_tag_name((carddav_ns, "address-data")))
+                .and_then(|n| n.text())
+                && let Some(contact) = parse_vcard(vcard_data)
+            {
+                contacts.push(contact);
             }
         }
 
-        // Sort by name
         contacts.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-
         Ok(contacts)
     }
 
@@ -221,31 +245,58 @@ impl CardDavClient {
     }
 }
 
-/// Extract value between XML tags (simple, non-recursive)
-fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-    let open_tag = format!("<{}", tag);
-    let close_tag = format!("</{}>", tag);
+/// Unfold vCard lines per RFC 6350 §3.2: continuation lines start with a space or tab.
+fn unfold_vcard(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation line — append without the leading whitespace
+            result.push_str(&line[1..]);
+        } else {
+            if !result.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(line);
+        }
+    }
+    result
+}
 
-    let start = xml.find(&open_tag)?;
-    let after_open = &xml[start..];
-
-    // Find end of opening tag
-    let tag_end = after_open.find('>')?;
-    let content_start = start + tag_end + 1;
-
-    // Find closing tag
-    let close_start = xml[content_start..].find(&close_tag)?;
-
-    Some(
-        xml[content_start..content_start + close_start]
-            .trim()
-            .to_string(),
-    )
+/// Decode quoted-printable encoded value (basic implementation for vCard)
+fn decode_qp(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut decoded_bytes = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && i + 2 < bytes.len() {
+            if bytes[i + 1] == b'\r' || bytes[i + 1] == b'\n' {
+                // Soft line break — skip
+                i += 2;
+                if i < bytes.len() && bytes[i] == b'\n' {
+                    i += 1;
+                }
+            } else if let (Some(hi), Some(lo)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                decoded_bytes.push((hi * 16 + lo) as u8);
+                i += 3;
+            } else {
+                decoded_bytes.push(b'=');
+                i += 1;
+            }
+        } else {
+            decoded_bytes.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded_bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 /// Parse a vCard string into a Contact
 fn parse_vcard(vcard_str: &str) -> Option<Contact> {
-    // Simple manual vCard parsing since the vcard crate API is awkward
+    let unfolded = unfold_vcard(vcard_str);
     let mut id = String::new();
     let mut name = String::new();
     let mut emails = Vec::new();
@@ -254,13 +305,23 @@ fn parse_vcard(vcard_str: &str) -> Option<Contact> {
     let mut title = None;
     let mut notes = None;
 
-    for line in vcard_str.lines() {
+    for line in unfolded.lines() {
         let line = line.trim();
 
-        if line.starts_with("UID:") {
-            id = line.strip_prefix("UID:").unwrap_or("").to_string();
-        } else if line.starts_with("FN:") {
-            name = line.strip_prefix("FN:").unwrap_or("").to_string();
+        // Extract property value, handling optional parameters and QP encoding
+        let extract_value = |line: &str| -> String {
+            let value = line.split_once(':').map(|(_, v)| v).unwrap_or("");
+            if line.to_uppercase().contains("ENCODING=QUOTED-PRINTABLE") {
+                decode_qp(value)
+            } else {
+                value.to_string()
+            }
+        };
+
+        if line.starts_with("UID") && line.contains(':') {
+            id = extract_value(line);
+        } else if line.starts_with("FN") && line.contains(':') {
+            name = extract_value(line);
         } else if line.starts_with("EMAIL") {
             // EMAIL;TYPE=work:bob@example.com or EMAIL:bob@example.com
             let label = if line.contains("TYPE=") {
@@ -289,12 +350,12 @@ fn parse_vcard(vcard_str: &str) -> Option<Contact> {
             if !number.is_empty() {
                 phones.push(ContactPhone { number, label });
             }
-        } else if line.starts_with("ORG:") {
-            organization = Some(line.strip_prefix("ORG:").unwrap_or("").to_string());
-        } else if line.starts_with("TITLE:") {
-            title = Some(line.strip_prefix("TITLE:").unwrap_or("").to_string());
-        } else if line.starts_with("NOTE:") {
-            notes = Some(line.strip_prefix("NOTE:").unwrap_or("").to_string());
+        } else if line.starts_with("ORG") && line.contains(':') {
+            organization = Some(extract_value(line));
+        } else if line.starts_with("TITLE") && line.contains(':') {
+            title = Some(extract_value(line));
+        } else if line.starts_with("NOTE") && line.contains(':') {
+            notes = Some(extract_value(line));
         }
     }
 
@@ -325,4 +386,78 @@ fn hash_id(s: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unfold_vcard_lines() {
+        // RFC 6350 §3.2: leading space/tab is the fold indicator and is consumed
+        let input = "FN:John\n  Doe\nEMAIL:john@example.com";
+        let result = unfold_vcard(input);
+        assert_eq!(result, "FN:John Doe\nEMAIL:john@example.com");
+    }
+
+    #[test]
+    fn test_unfold_tab_continuation() {
+        let input = "FN:John\n\tDoe";
+        let result = unfold_vcard(input);
+        assert_eq!(result, "FN:JohnDoe");
+    }
+
+    #[test]
+    fn test_decode_qp_basic() {
+        assert_eq!(decode_qp("hello=20world"), "hello world");
+        assert_eq!(decode_qp("caf=C3=A9"), "café");
+    }
+
+    #[test]
+    fn test_decode_qp_soft_linebreak() {
+        assert_eq!(decode_qp("hello=\nworld"), "helloworld");
+    }
+
+    #[test]
+    fn test_parse_vcard_basic() {
+        let vcard = "BEGIN:VCARD\nVERSION:3.0\nUID:abc123\nFN:Alice Smith\nEMAIL:alice@example.com\nEND:VCARD";
+        let contact = parse_vcard(vcard).unwrap();
+        assert_eq!(contact.id, "abc123");
+        assert_eq!(contact.name, "Alice Smith");
+        assert_eq!(contact.emails.len(), 1);
+        assert_eq!(contact.emails[0].email, "alice@example.com");
+    }
+
+    #[test]
+    fn test_parse_vcard_with_line_folding() {
+        // Fold happens mid-value: "Very Long Name Here" folded after "Na"
+        // Continuation line starts with space (fold indicator consumed)
+        let vcard = "BEGIN:VCARD\nFN:Very Long Na\n me Here\nEMAIL:test@example.com\nEND:VCARD";
+        let contact = parse_vcard(vcard).unwrap();
+        assert_eq!(contact.name, "Very Long Name Here");
+    }
+
+    #[test]
+    fn test_parse_vcard_with_params() {
+        let vcard = "BEGIN:VCARD\nFN:Bob\nEMAIL;TYPE=work:bob@work.com\nTEL;TYPE=cell:+1234567890\nORG:Acme Inc\nTITLE:Engineer\nEND:VCARD";
+        let contact = parse_vcard(vcard).unwrap();
+        assert_eq!(contact.emails[0].email, "bob@work.com");
+        assert_eq!(contact.emails[0].label, Some("work".to_string()));
+        assert_eq!(contact.phones[0].number, "+1234567890");
+        assert_eq!(contact.organization, Some("Acme Inc".to_string()));
+        assert_eq!(contact.title, Some("Engineer".to_string()));
+    }
+
+    #[test]
+    fn test_parse_vcard_generates_id_when_missing() {
+        let vcard = "BEGIN:VCARD\nFN:No UID\nEND:VCARD";
+        let contact = parse_vcard(vcard).unwrap();
+        assert!(!contact.id.is_empty());
+    }
+
+    #[test]
+    fn test_parse_vcard_returns_none_without_name() {
+        let vcard = "BEGIN:VCARD\nUID:abc\nEMAIL:test@example.com\nEND:VCARD";
+        assert!(parse_vcard(vcard).is_none());
+    }
 }

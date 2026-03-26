@@ -1174,6 +1174,7 @@ dependencies = [
  "kreuzberg",
  "reqwest",
  "rmcp",
+ "roxmltree",
  "schemars 0.8.22",
  "serde",
  "serde_json",

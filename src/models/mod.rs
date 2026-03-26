@@ -264,7 +264,7 @@ impl<T: Serialize> Output<T> {
     pub fn print(&self) {
         match serde_json::to_string_pretty(self) {
             Ok(json) => println!("{json}"),
-            Err(e) => eprintln!("{{\"success\":false,\"error\":\"Serialization failed: {e}\"}}")
+            Err(e) => eprintln!("{{\"success\":false,\"error\":\"Serialization failed: {e}\"}}"),
         }
     }
 }

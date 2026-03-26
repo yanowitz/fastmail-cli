@@ -49,6 +49,16 @@ struct ThreadingHeaders {
     references: Vec<String>,
 }
 
+/// Bundled content for the create_and_submit_email helper
+struct EmailDraft<'a> {
+    to: &'a [EmailAddress],
+    cc: &'a [EmailAddress],
+    bcc: &'a [EmailAddress],
+    subject: &'a str,
+    body: &'a str,
+    threading: Option<ThreadingHeaders>,
+}
+
 /// Resolved context for a compose operation
 struct ComposeContext {
     account_id: String,
@@ -717,36 +727,36 @@ impl JmapClient {
     async fn create_and_submit_email(
         &self,
         ctx: &ComposeContext,
-        to: &[EmailAddress],
-        cc: &[EmailAddress],
-        bcc: &[EmailAddress],
-        subject: &str,
-        body: &str,
-        threading: Option<ThreadingHeaders>,
+        draft: EmailDraft<'_>,
     ) -> Result<String> {
         fn addrs_json(addrs: &[EmailAddress]) -> Value {
-            json!(addrs.iter().map(|a| json!({"email": a.email, "name": a.name})).collect::<Vec<_>>())
+            json!(
+                addrs
+                    .iter()
+                    .map(|a| json!({"email": a.email, "name": a.name}))
+                    .collect::<Vec<_>>()
+            )
         }
 
         let mut email_create: HashMap<String, Value> = HashMap::new();
         ctx.apply_to_email(&mut email_create);
-        email_create.insert("to".into(), addrs_json(to));
-        if !cc.is_empty() {
-            email_create.insert("cc".into(), addrs_json(cc));
+        email_create.insert("to".into(), addrs_json(draft.to));
+        if !draft.cc.is_empty() {
+            email_create.insert("cc".into(), addrs_json(draft.cc));
         }
-        if !bcc.is_empty() {
-            email_create.insert("bcc".into(), addrs_json(bcc));
+        if !draft.bcc.is_empty() {
+            email_create.insert("bcc".into(), addrs_json(draft.bcc));
         }
-        email_create.insert("subject".into(), json!(subject));
+        email_create.insert("subject".into(), json!(draft.subject));
         email_create.insert(
             "bodyValues".into(),
-            json!({ "body": { "value": body, "charset": "utf-8" } }),
+            json!({ "body": { "value": draft.body, "charset": "utf-8" } }),
         );
         email_create.insert(
             "textBody".into(),
             json!([{ "partId": "body", "type": "text/plain" }]),
         );
-        if let Some(ref headers) = threading {
+        if let Some(ref headers) = draft.threading {
             if !headers.in_reply_to.is_empty() {
                 email_create.insert("inReplyTo".into(), json!(headers.in_reply_to));
             }
@@ -772,12 +782,21 @@ impl JmapClient {
         params: ComposeParams<'_>,
     ) -> Result<String> {
         let ctx = self.prepare_compose(params.from, params.draft).await?;
-        let threading = in_reply_to.map(|id| ThreadingHeaders {
-            in_reply_to: vec![id.to_string()],
-            references: vec![],
-        });
-        self.create_and_submit_email(&ctx, &to, &params.cc, &params.bcc, subject, body, threading)
-            .await
+        self.create_and_submit_email(
+            &ctx,
+            EmailDraft {
+                to: &to,
+                cc: &params.cc,
+                bcc: &params.bcc,
+                subject,
+                body,
+                threading: in_reply_to.map(|id| ThreadingHeaders {
+                    in_reply_to: vec![id.to_string()],
+                    references: vec![],
+                }),
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
@@ -929,13 +948,19 @@ impl JmapClient {
             refs
         };
 
-        let threading = ThreadingHeaders {
-            in_reply_to: original.message_id.clone().unwrap_or_default(),
-            references,
-        };
-
         self.create_and_submit_email(
-            &ctx, &to_addrs, &cc_addrs, &params.bcc, &subject, body, Some(threading),
+            &ctx,
+            EmailDraft {
+                to: &to_addrs,
+                cc: &cc_addrs,
+                bcc: &params.bcc,
+                subject: &subject,
+                body,
+                threading: Some(ThreadingHeaders {
+                    in_reply_to: original.message_id.clone().unwrap_or_default(),
+                    references,
+                }),
+            },
         )
         .await
     }
@@ -983,8 +1008,18 @@ impl JmapClient {
             original_body
         );
 
-        self.create_and_submit_email(&ctx, &to, &params.cc, &params.bcc, &subject, &full_body, None)
-            .await
+        self.create_and_submit_email(
+            &ctx,
+            EmailDraft {
+                to: &to,
+                cc: &params.cc,
+                bcc: &params.bcc,
+                subject: &subject,
+                body: &full_body,
+                threading: None,
+            },
+        )
+        .await
     }
 
     #[instrument(skip(self))]
