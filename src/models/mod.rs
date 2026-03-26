@@ -165,14 +165,6 @@ impl Email {
         self.keywords.contains_key("$draft")
     }
 
-    pub fn sender_display(&self) -> String {
-        self.from
-            .as_ref()
-            .and_then(|addrs| addrs.first())
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "(unknown)".into())
-    }
-
     pub fn text_content(&self) -> Option<&str> {
         let body_values = self.body_values.as_ref()?;
         let text_body = self.text_body.as_ref()?;
@@ -370,69 +362,6 @@ mod tests {
         assert!(!email.is_flagged());
         email.keywords.insert("$flagged".to_string(), true);
         assert!(email.is_flagged());
-    }
-
-    #[test]
-    fn test_email_sender_display() {
-        let email = Email {
-            id: "test".to_string(),
-            blob_id: None,
-            thread_id: None,
-            mailbox_ids: HashMap::new(),
-            keywords: HashMap::new(),
-            size: 0,
-            received_at: None,
-            message_id: None,
-            in_reply_to: None,
-            references: None,
-            from: Some(vec![EmailAddress {
-                name: Some("Sender".to_string()),
-                email: "sender@example.com".to_string(),
-            }]),
-            to: None,
-            cc: None,
-            bcc: None,
-            reply_to: None,
-            subject: None,
-            sent_at: None,
-            preview: None,
-            has_attachment: false,
-            text_body: None,
-            html_body: None,
-            attachments: None,
-            body_values: None,
-        };
-        assert_eq!(email.sender_display(), "Sender <sender@example.com>");
-    }
-
-    #[test]
-    fn test_email_sender_display_no_from() {
-        let email = Email {
-            id: "test".to_string(),
-            blob_id: None,
-            thread_id: None,
-            mailbox_ids: HashMap::new(),
-            keywords: HashMap::new(),
-            size: 0,
-            received_at: None,
-            message_id: None,
-            in_reply_to: None,
-            references: None,
-            from: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reply_to: None,
-            subject: None,
-            sent_at: None,
-            preview: None,
-            has_attachment: false,
-            text_body: None,
-            html_body: None,
-            attachments: None,
-            body_values: None,
-        };
-        assert_eq!(email.sender_display(), "(unknown)");
     }
 
     #[test]

@@ -12,7 +12,7 @@ impl QueryRoot {
     /// List all mailboxes (folders) with unread counts. Start here to discover available folders.
     async fn mailboxes(&self, ctx: &Context<'_>) -> Result<Vec<GqlMailbox>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
         let mut mailboxes = client.list_mailboxes().await?;
         mailboxes.sort_by(|a, b| match (&a.role, &b.role) {
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -35,7 +35,7 @@ impl QueryRoot {
         >,
     ) -> Result<Vec<GqlEmailSummary>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
         let emails = client.list_emails(&mb.id, limit).await?;
@@ -95,7 +95,7 @@ impl QueryRoot {
         #[graphql(desc = "Maximum number of results (default 25, max 100)")] limit: Option<u32>,
     ) -> Result<Vec<GqlEmailSummary>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
 
         let filter = crate::commands::SearchFilter {

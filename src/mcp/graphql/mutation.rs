@@ -42,7 +42,7 @@ impl MutationRoot {
 
         let draft = matches!(action, SendAction::Draft);
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
 
         match client
             .send_email(
@@ -88,7 +88,7 @@ impl MutationRoot {
         #[graphql(desc = "Send from a specific identity/email address")] from: Option<String>,
     ) -> Result<GqlComposeResult> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
 
         let original = client.get_email(&email_id).await?;
         let reply_all = all.unwrap_or(false);
@@ -182,7 +182,7 @@ impl MutationRoot {
         #[graphql(desc = "Send from a specific identity/email address")] from: Option<String>,
     ) -> Result<GqlComposeResult> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
 
         let original = client.get_email(&email_id).await?;
         let to_addrs = parse_addresses(&to);
@@ -271,7 +271,7 @@ impl MutationRoot {
         target_mailbox: String,
     ) -> Result<GqlStatus> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
 
         let email = client.get_email(&email_id).await?;
         let target = client.find_mailbox(&target_mailbox).await?;
@@ -343,7 +343,7 @@ impl MutationRoot {
         #[graphql(desc = "PREVIEW first, then CONFIRM")] action: SpamAction,
     ) -> Result<GqlStatus> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let client = client.lock().await;
+        let mut client = client.lock().await;
 
         let email = client.get_email(&email_id).await?;
 
