@@ -472,8 +472,20 @@ pub struct GqlComposeResult {
     pub email_id: Option<String>,
     /// Preview text (for preview action)
     pub preview: Option<String>,
+    /// Confirmation token — returned by PREVIEW, required by CONFIRM/DRAFT
+    pub confirmation_token: Option<String>,
     /// Error message if failed
     pub error: Option<String>,
+}
+
+/// Generate a confirmation token from email parameters (stateless preview guard)
+pub fn confirmation_token(parts: &[&str]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 #[derive(SimpleObject)]

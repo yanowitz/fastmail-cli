@@ -12,7 +12,7 @@ pub struct MutationRoot;
 #[Object]
 #[allow(clippy::too_many_arguments)]
 impl MutationRoot {
-    /// Compose and send a new email. ALWAYS use action=PREVIEW first, show the user, then CONFIRM or DRAFT.
+    /// Compose and send a new email. ALWAYS use action=PREVIEW first, show the user, then CONFIRM or DRAFT with the confirmation_token from the preview.
     async fn send_email(
         &self,
         ctx: &Context<'_>,
@@ -24,10 +24,13 @@ impl MutationRoot {
         #[graphql(desc = "CC recipients, comma-separated")] cc: Option<String>,
         #[graphql(desc = "BCC recipients (hidden), comma-separated")] bcc: Option<String>,
         #[graphql(desc = "Send from a specific identity/email address")] from: Option<String>,
+        #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
+        confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
         let to_addrs = parse_addresses(&to);
         let cc_addrs = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
+        let token = super::types::confirmation_token(&[&to, &subject, &body]);
 
         if matches!(action, SendAction::Preview) {
             return Ok(GqlComposeResult {
@@ -36,7 +39,21 @@ impl MutationRoot {
                 preview: Some(format_send_preview(
                     &to_addrs, &cc_addrs, &bcc_addrs, &subject, &body,
                 )),
+                confirmation_token: Some(token),
                 error: None,
+            });
+        }
+
+        if confirmation_token.as_deref() != Some(&token) {
+            return Ok(GqlComposeResult {
+                success: false,
+                email_id: None,
+                preview: None,
+                confirmation_token: None,
+                error: Some(
+                    "Missing or invalid confirmation_token. Use action=PREVIEW first to get the token."
+                        .to_string(),
+                ),
             });
         }
 
@@ -63,12 +80,14 @@ impl MutationRoot {
                 success: true,
                 email_id: Some(email_id),
                 preview: None,
+                confirmation_token: None,
                 error: None,
             }),
             Err(e) => Ok(GqlComposeResult {
                 success: false,
                 email_id: None,
                 preview: None,
+                confirmation_token: None,
                 error: Some(e.to_string()),
             }),
         }
@@ -86,7 +105,10 @@ impl MutationRoot {
         #[graphql(desc = "CC recipients, comma-separated")] cc: Option<String>,
         #[graphql(desc = "BCC recipients, comma-separated")] bcc: Option<String>,
         #[graphql(desc = "Send from a specific identity/email address")] from: Option<String>,
+        #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
+        confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
+        let token = super::types::confirmation_token(&[&email_id, &body]);
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
@@ -134,7 +156,20 @@ impl MutationRoot {
                     in_reply_to,
                     body
                 )),
+                confirmation_token: Some(token),
                 error: None,
+            });
+        }
+
+        if confirmation_token.as_deref() != Some(&token) {
+            return Ok(GqlComposeResult {
+                success: false,
+                email_id: None,
+                preview: None,
+                confirmation_token: None,
+                error: Some(
+                    "Missing or invalid confirmation_token. Use action=PREVIEW first.".to_string(),
+                ),
             });
         }
 
@@ -157,12 +192,14 @@ impl MutationRoot {
                 success: true,
                 email_id: Some(eid),
                 preview: None,
+                confirmation_token: None,
                 error: None,
             }),
             Err(e) => Ok(GqlComposeResult {
                 success: false,
                 email_id: None,
                 preview: None,
+                confirmation_token: None,
                 error: Some(e.to_string()),
             }),
         }
@@ -180,7 +217,11 @@ impl MutationRoot {
         #[graphql(desc = "CC recipients, comma-separated")] cc: Option<String>,
         #[graphql(desc = "BCC recipients, comma-separated")] bcc: Option<String>,
         #[graphql(desc = "Send from a specific identity/email address")] from: Option<String>,
+        #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
+        confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
+        let body_str = body.as_deref().unwrap_or("");
+        let token = super::types::confirmation_token(&[&email_id, &to, body_str]);
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
@@ -188,7 +229,6 @@ impl MutationRoot {
         let to_addrs = parse_addresses(&to);
         let cc_addrs = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
-        let body_str = body.as_deref().unwrap_or("");
 
         let subject = if original
             .subject
@@ -228,7 +268,20 @@ impl MutationRoot {
                     original.subject.as_deref().unwrap_or(""),
                     original_body,
                 )),
+                confirmation_token: Some(token),
                 error: None,
+            });
+        }
+
+        if confirmation_token.as_deref() != Some(&token) {
+            return Ok(GqlComposeResult {
+                success: false,
+                email_id: None,
+                preview: None,
+                confirmation_token: None,
+                error: Some(
+                    "Missing or invalid confirmation_token. Use action=PREVIEW first.".to_string(),
+                ),
             });
         }
 
@@ -251,12 +304,14 @@ impl MutationRoot {
                 success: true,
                 email_id: Some(eid),
                 preview: None,
+                confirmation_token: None,
                 error: None,
             }),
             Err(e) => Ok(GqlComposeResult {
                 success: false,
                 email_id: None,
                 preview: None,
+                confirmation_token: None,
                 error: Some(e.to_string()),
             }),
         }
