@@ -152,7 +152,6 @@ pub struct Email {
     pub body_values: Option<HashMap<String, EmailBodyValue>>,
 }
 
-#[allow(dead_code)]
 impl Email {
     pub fn is_unread(&self) -> bool {
         !self.keywords.contains_key("$seen")
@@ -271,7 +270,10 @@ impl<T: Serialize> Output<T> {
     }
 
     pub fn print(&self) {
-        println!("{}", serde_json::to_string_pretty(self).unwrap());
+        match serde_json::to_string_pretty(self) {
+            Ok(json) => println!("{json}"),
+            Err(e) => eprintln!("{{\"success\":false,\"error\":\"Serialization failed: {e}\"}}")
+        }
     }
 }
 

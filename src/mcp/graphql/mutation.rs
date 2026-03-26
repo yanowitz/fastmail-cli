@@ -201,12 +201,7 @@ impl MutationRoot {
         };
 
         if matches!(action, SendAction::Preview) {
-            let original_body = original
-                .body_values
-                .as_ref()
-                .and_then(|bv| bv.values().next())
-                .map(|v| v.value.as_str())
-                .unwrap_or("");
+            let original_body = original.text_content().unwrap_or("");
             let sender = format_addrs(&original.from.clone().unwrap_or_default());
 
             return Ok(GqlComposeResult {

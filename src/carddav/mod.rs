@@ -305,7 +305,7 @@ fn parse_vcard(vcard_str: &str) -> Option<Contact> {
 
     // Generate ID if not present
     if id.is_empty() {
-        id = format!("{:x}", md5_hash(&name));
+        id = format!("{:x}", hash_id(&name));
     }
 
     Some(Contact {
@@ -319,8 +319,8 @@ fn parse_vcard(vcard_str: &str) -> Option<Contact> {
     })
 }
 
-/// Simple hash for generating IDs
-fn md5_hash(s: &str) -> u64 {
+/// Simple SipHash-based hash for generating stable contact IDs
+fn hash_id(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut hasher);

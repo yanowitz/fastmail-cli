@@ -23,6 +23,7 @@ pub struct JmapClient {
     token: String,
     session: Option<Session>,
     available_capabilities: Vec<String>,
+    cached_mailboxes: Option<Vec<Mailbox>>,
 }
 
 /// Create an authenticated JMAP client from config
@@ -170,6 +171,7 @@ impl JmapClient {
             token,
             session: None,
             available_capabilities: Vec::new(),
+            cached_mailboxes: None,
         }
     }
 
@@ -203,6 +205,12 @@ impl JmapClient {
 
     pub fn session(&self) -> Result<&Session> {
         self.session.as_ref().ok_or(Error::NotAuthenticated)
+    }
+
+    fn account_id(&self) -> Result<&str> {
+        self.session()?
+            .primary_account_id()
+            .ok_or_else(|| Error::Config("No primary account".into()))
     }
 
     fn require_capability(&self, capability: &str, action: &str) -> Result<()> {
@@ -293,11 +301,12 @@ impl JmapClient {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_mailboxes(&self) -> Result<Vec<Mailbox>> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+    pub async fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
+        if let Some(ref cached) = self.cached_mailboxes {
+            return Ok(cached.clone());
+        }
+
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -317,10 +326,11 @@ impl JmapClient {
         let resp: GetResponse<Mailbox> =
             Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/get")?;
 
+        self.cached_mailboxes = Some(resp.list.clone());
         Ok(resp.list)
     }
 
-    pub async fn find_mailbox(&self, name: &str) -> Result<Mailbox> {
+    pub async fn find_mailbox(&mut self, name: &str) -> Result<Mailbox> {
         let mailboxes = self.list_mailboxes().await?;
         let name_lower = name.to_lowercase();
 
@@ -343,10 +353,7 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn list_emails(&self, mailbox_id: &str, limit: u32) -> Result<Vec<Email>> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![
@@ -388,10 +395,7 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn get_email(&self, email_id: &str) -> Result<Email> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -429,10 +433,7 @@ impl JmapClient {
     /// Get all emails in a thread
     #[instrument(skip(self))]
     pub async fn get_thread(&self, email_id: &str) -> Result<Vec<Email>> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         // First get the email to find its threadId
         let email = self.get_email(email_id).await?;
@@ -500,10 +501,7 @@ impl JmapClient {
         mailbox_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<Email>> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         // Build JMAP filter object
         let mut jmap_filter = json!({});
@@ -605,10 +603,7 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn list_identities(&self) -> Result<Vec<Identity>> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -629,15 +624,11 @@ impl JmapClient {
         pick_identity(identities, from)
     }
 
-    async fn prepare_compose(&self, from: Option<&str>, draft: bool) -> Result<ComposeContext> {
+    async fn prepare_compose(&mut self, from: Option<&str>, draft: bool) -> Result<ComposeContext> {
         if !draft {
             self.require_capability("urn:ietf:params:jmap:submission", "Email sending")?;
         }
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?
-            .to_string();
+        let account_id = self.account_id()?.to_string();
         let mailbox = if draft {
             self.find_mailbox("drafts").await?
         } else {
@@ -678,6 +669,29 @@ impl JmapClient {
             });
         }
 
+        // Check EmailSubmission/set response if present (index 1)
+        if let Some(submission_resp) = responses.get(1) {
+            let sub: EmailSetResponse =
+                Self::parse_response(submission_resp, "EmailSubmission/set")?;
+            if let Some(ref not_created) = sub.not_created
+                && let Some(err) = not_created.get("submission")
+            {
+                let error_type = err
+                    .get("type")
+                    .and_then(|v: &Value| v.as_str())
+                    .unwrap_or("unknown");
+                let description = err
+                    .get("description")
+                    .and_then(|v: &Value| v.as_str())
+                    .unwrap_or("Email created but submission failed");
+                return Err(Error::Jmap {
+                    method: "EmailSubmission/set".into(),
+                    error_type: error_type.into(),
+                    description: description.into(),
+                });
+            }
+        }
+
         email_resp
             .created
             .and_then(|c: HashMap<String, Value>| c.get("email").cloned())
@@ -695,7 +709,7 @@ impl JmapClient {
 
     #[instrument(skip(self, body, params))]
     pub async fn send_email(
-        &self,
+        &mut self,
         to: Vec<EmailAddress>,
         subject: &str,
         body: &str,
@@ -760,10 +774,7 @@ impl JmapClient {
 
     #[instrument(skip(self))]
     pub async fn move_email(&self, email_id: &str, mailbox_id: &str) -> Result<()> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -805,7 +816,7 @@ impl JmapClient {
     }
 
     #[instrument(skip(self))]
-    pub async fn mark_spam(&self, email_id: &str) -> Result<()> {
+    pub async fn mark_spam(&mut self, email_id: &str) -> Result<()> {
         let junk = self.find_mailbox("junk").await?;
         self.move_email(email_id, &junk.id).await
     }
@@ -813,10 +824,8 @@ impl JmapClient {
     /// Download a blob (attachment) by ID
     #[instrument(skip(self))]
     pub async fn download_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        let account_id = self.account_id()?;
         let session = self.session()?;
-        let account_id = session
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
 
         // downloadUrl template: https://api.fastmail.com/jmap/download/{accountId}/{blobId}/{name}?accept={type}
         let url = session
@@ -849,7 +858,7 @@ impl JmapClient {
     /// Send a reply to an existing email with proper threading headers
     #[instrument(skip(self, body, params))]
     pub async fn reply_email(
-        &self,
+        &mut self,
         original: &Email,
         body: &str,
         reply_all: bool,
@@ -974,7 +983,7 @@ impl JmapClient {
     /// Forward an email with proper attribution
     #[instrument(skip(self, body, params))]
     pub async fn forward_email(
-        &self,
+        &mut self,
         original: &Email,
         to: Vec<EmailAddress>,
         body: &str,
@@ -994,24 +1003,13 @@ impl JmapClient {
         };
 
         // Build forwarded body with attribution
-        let original_body = original
-            .body_values
-            .as_ref()
-            .and_then(|bv| bv.values().next())
-            .map(|v| v.value.as_str())
-            .unwrap_or("");
+        let original_body = original.text_content().unwrap_or("");
 
         let sender = original
             .from
             .as_ref()
             .and_then(|f| f.first())
-            .map(|a| {
-                if let Some(ref name) = a.name {
-                    format!("{} <{}>", name, a.email)
-                } else {
-                    a.email.clone()
-                }
-            })
+            .map(|a| a.to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         let date = original.received_at.as_deref().unwrap_or("unknown date");
@@ -1082,10 +1080,7 @@ impl JmapClient {
         email_id: &str,
         keywords: HashMap<String, bool>,
     ) -> Result<()> {
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -1130,10 +1125,7 @@ impl JmapClient {
     #[instrument(skip(self))]
     pub async fn list_masked_emails(&self) -> Result<Vec<MaskedEmail>> {
         self.require_capability("https://www.fastmail.com/dev/maskedemail", "Masked email")?;
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let responses = self
             .request(vec![json!([
@@ -1161,10 +1153,7 @@ impl JmapClient {
         email_prefix: Option<&str>,
     ) -> Result<MaskedEmail> {
         self.require_capability("https://www.fastmail.com/dev/maskedemail", "Masked email")?;
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let mut create_obj: HashMap<String, Value> = HashMap::new();
         create_obj.insert("state".into(), json!("enabled"));
@@ -1230,10 +1219,7 @@ impl JmapClient {
         description: Option<&str>,
     ) -> Result<()> {
         self.require_capability("https://www.fastmail.com/dev/maskedemail", "Masked email")?;
-        let account_id = self
-            .session()?
-            .primary_account_id()
-            .ok_or_else(|| Error::Config("No primary account".into()))?;
+        let account_id = self.account_id()?;
 
         let mut update_obj: HashMap<String, Value> = HashMap::new();
         if let Some(s) = state {
