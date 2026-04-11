@@ -35,12 +35,21 @@ pub async fn authenticated_client() -> crate::error::Result<JmapClient> {
     Ok(client)
 }
 
+/// File attachment data ready for upload
+pub struct AttachmentData {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 /// Common parameters for compose operations (send, reply, forward)
 pub struct ComposeParams<'a> {
     pub cc: Vec<EmailAddress>,
     pub bcc: Vec<EmailAddress>,
     pub from: Option<&'a str>,
     pub draft: bool,
+    pub html_body: Option<String>,
+    pub attachments: Vec<AttachmentData>,
 }
 
 /// Threading headers for reply/forward
@@ -56,7 +65,80 @@ struct EmailDraft<'a> {
     bcc: &'a [EmailAddress],
     subject: &'a str,
     body: &'a str,
+    html_body: Option<&'a str>,
+    attachments: Vec<AttachmentData>,
     threading: Option<ThreadingHeaders>,
+}
+
+/// An attachment after blob upload — holds the server-assigned blobId.
+#[derive(Debug)]
+struct UploadedAttachment {
+    blob_id: String,
+    filename: String,
+    content_type: String,
+}
+
+/// Build bodyValues and body structure fields on `email_create`.
+///
+/// Handles three JMAP body modes:
+/// - Plain text only → `textBody` array
+/// - Text + HTML (no attachments) → `textBody` + `htmlBody` arrays
+/// - With attachments → explicit `bodyStructure` MIME tree
+fn apply_body_structure(
+    email_create: &mut HashMap<String, Value>,
+    text_body: &str,
+    html_body: Option<&str>,
+    attachments: &[UploadedAttachment],
+) {
+    let mut body_values = json!({
+        "textBody": { "value": text_body, "charset": "utf-8" }
+    });
+    if let Some(html) = html_body {
+        body_values["htmlBody"] = json!({ "value": html, "charset": "utf-8" });
+    }
+    email_create.insert("bodyValues".into(), body_values);
+
+    let has_html = html_body.is_some();
+    let has_attachments = !attachments.is_empty();
+
+    if has_attachments {
+        let text_part = json!({ "partId": "textBody", "type": "text/plain" });
+        let content_part = if has_html {
+            let html_part = json!({ "partId": "htmlBody", "type": "text/html" });
+            json!({ "type": "multipart/alternative", "subParts": [text_part, html_part] })
+        } else {
+            text_part
+        };
+
+        let mut sub_parts = vec![content_part];
+        for att in attachments {
+            sub_parts.push(json!({
+                "blobId": att.blob_id,
+                "name": att.filename,
+                "type": att.content_type,
+                "disposition": "attachment"
+            }));
+        }
+
+        email_create.insert(
+            "bodyStructure".into(),
+            json!({ "type": "multipart/mixed", "subParts": sub_parts }),
+        );
+    } else if has_html {
+        email_create.insert(
+            "textBody".into(),
+            json!([{ "partId": "textBody", "type": "text/plain" }]),
+        );
+        email_create.insert(
+            "htmlBody".into(),
+            json!([{ "partId": "htmlBody", "type": "text/html" }]),
+        );
+    } else {
+        email_create.insert(
+            "textBody".into(),
+            json!([{ "partId": "textBody", "type": "text/plain" }]),
+        );
+    }
 }
 
 /// Resolved context for a compose operation
@@ -724,6 +806,7 @@ impl JmapClient {
     }
 
     /// Shared helper: build email_create map with common fields and submit it.
+    /// Handles plain text, HTML, and attachment body structures.
     async fn create_and_submit_email(
         &self,
         ctx: &ComposeContext,
@@ -748,14 +831,25 @@ impl JmapClient {
             email_create.insert("bcc".into(), addrs_json(draft.bcc));
         }
         email_create.insert("subject".into(), json!(draft.subject));
-        email_create.insert(
-            "bodyValues".into(),
-            json!({ "body": { "value": draft.body, "charset": "utf-8" } }),
+
+        // Upload attachments and collect blob IDs
+        let mut uploaded_attachments: Vec<UploadedAttachment> = Vec::new();
+        for att in draft.attachments {
+            let blob_id = self.upload_blob(att.data, &att.content_type).await?;
+            uploaded_attachments.push(UploadedAttachment {
+                blob_id,
+                filename: att.filename,
+                content_type: att.content_type,
+            });
+        }
+
+        apply_body_structure(
+            &mut email_create,
+            draft.body,
+            draft.html_body,
+            &uploaded_attachments,
         );
-        email_create.insert(
-            "textBody".into(),
-            json!([{ "partId": "body", "type": "text/plain" }]),
-        );
+
         if let Some(ref headers) = draft.threading {
             if !headers.in_reply_to.is_empty() {
                 email_create.insert("inReplyTo".into(), json!(headers.in_reply_to));
@@ -790,6 +884,8 @@ impl JmapClient {
                 bcc: &params.bcc,
                 subject,
                 body,
+                html_body: params.html_body.as_deref(),
+                attachments: params.attachments,
                 threading: in_reply_to.map(|id| ThreadingHeaders {
                     in_reply_to: vec![id.to_string()],
                     references: vec![],
@@ -882,6 +978,42 @@ impl JmapClient {
         Ok(bytes.to_vec())
     }
 
+    /// Upload a blob (for attachments) and return the blobId
+    #[instrument(skip(self, data))]
+    pub async fn upload_blob(&self, data: Vec<u8>, content_type: &str) -> Result<String> {
+        let account_id = self.account_id()?;
+        let session = self.session()?;
+
+        let url = session.upload_url.replace("{accountId}", account_id);
+
+        debug!(url = %url, content_type = %content_type, size = data.len(), "Uploading blob");
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header("Content-Type", content_type)
+            .body(data)
+            .send()
+            .await?;
+
+        match resp.status().as_u16() {
+            200..=299 => {}
+            401 => return Err(Error::InvalidToken("Token expired or invalid".into())),
+            429 => return Err(Error::RateLimited),
+            500..=599 => return Err(Error::Server(format!("Server error: {}", resp.status()))),
+            code => {
+                let text = resp.text().await.unwrap_or_default();
+                return Err(Error::Server(format!("Upload failed ({}): {}", code, text)));
+            }
+        }
+
+        let body: Value = resp.json().await?;
+        body.get("blobId")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| Error::Server("Upload response missing blobId".into()))
+    }
+
     /// Send a reply to an existing email with proper threading headers
     #[instrument(skip(self, body, params))]
     pub async fn reply_email(
@@ -956,6 +1088,8 @@ impl JmapClient {
                 bcc: &params.bcc,
                 subject: &subject,
                 body,
+                html_body: params.html_body.as_deref(),
+                attachments: params.attachments,
                 threading: Some(ThreadingHeaders {
                     in_reply_to: original.message_id.clone().unwrap_or_default(),
                     references,
@@ -1016,6 +1150,8 @@ impl JmapClient {
                 bcc: &params.bcc,
                 subject: &subject,
                 body: &full_body,
+                html_body: params.html_body.as_deref(),
+                attachments: params.attachments,
                 threading: None,
             },
         )
@@ -1363,5 +1499,225 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("nobody@example.com"));
         assert!(err.contains("list identities"));
+    }
+
+    // ============ Body structure tests ============
+
+    #[test]
+    fn test_body_structure_plain_text_only() {
+        let mut email = HashMap::new();
+        apply_body_structure(&mut email, "Hello world", None, &[]);
+
+        // Should have textBody array, no htmlBody, no bodyStructure
+        assert!(email.contains_key("textBody"));
+        assert!(!email.contains_key("htmlBody"));
+        assert!(!email.contains_key("bodyStructure"));
+
+        let text_body = &email["textBody"];
+        assert_eq!(text_body[0]["partId"], "textBody");
+        assert_eq!(text_body[0]["type"], "text/plain");
+
+        let body_values = &email["bodyValues"];
+        assert_eq!(body_values["textBody"]["value"], "Hello world");
+        assert_eq!(body_values["textBody"]["charset"], "utf-8");
+    }
+
+    #[test]
+    fn test_body_structure_text_plus_html() {
+        let mut email = HashMap::new();
+        apply_body_structure(&mut email, "fallback", Some("<h1>Rich</h1>"), &[]);
+
+        // Should have both textBody and htmlBody arrays, no bodyStructure
+        assert!(email.contains_key("textBody"));
+        assert!(email.contains_key("htmlBody"));
+        assert!(!email.contains_key("bodyStructure"));
+
+        assert_eq!(email["textBody"][0]["partId"], "textBody");
+        assert_eq!(email["htmlBody"][0]["partId"], "htmlBody");
+        assert_eq!(email["htmlBody"][0]["type"], "text/html");
+
+        let body_values = &email["bodyValues"];
+        assert_eq!(body_values["textBody"]["value"], "fallback");
+        assert_eq!(body_values["htmlBody"]["value"], "<h1>Rich</h1>");
+    }
+
+    #[test]
+    fn test_body_structure_text_with_attachment() {
+        let mut email = HashMap::new();
+        let attachments = vec![UploadedAttachment {
+            blob_id: "Gblob123".into(),
+            filename: "report.pdf".into(),
+            content_type: "application/pdf".into(),
+        }];
+        apply_body_structure(&mut email, "See attached", None, &attachments);
+
+        // Must use bodyStructure, NOT textBody/htmlBody
+        assert!(email.contains_key("bodyStructure"));
+        assert!(!email.contains_key("textBody"));
+        assert!(!email.contains_key("htmlBody"));
+
+        let structure = &email["bodyStructure"];
+        assert_eq!(structure["type"], "multipart/mixed");
+
+        let parts = structure["subParts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+
+        // First part: plain text
+        assert_eq!(parts[0]["partId"], "textBody");
+        assert_eq!(parts[0]["type"], "text/plain");
+
+        // Second part: attachment
+        assert_eq!(parts[1]["blobId"], "Gblob123");
+        assert_eq!(parts[1]["name"], "report.pdf");
+        assert_eq!(parts[1]["type"], "application/pdf");
+        assert_eq!(parts[1]["disposition"], "attachment");
+    }
+
+    #[test]
+    fn test_body_structure_html_with_attachment() {
+        let mut email = HashMap::new();
+        let attachments = vec![UploadedAttachment {
+            blob_id: "Gblob456".into(),
+            filename: "_DSF1117.jpg".into(),
+            content_type: "image/jpeg".into(),
+        }];
+        apply_body_structure(
+            &mut email,
+            "Fallback text",
+            Some("<h1>Photo</h1>"),
+            &attachments,
+        );
+
+        assert!(email.contains_key("bodyStructure"));
+        assert!(!email.contains_key("textBody"));
+        assert!(!email.contains_key("htmlBody"));
+
+        let structure = &email["bodyStructure"];
+        assert_eq!(structure["type"], "multipart/mixed");
+
+        let parts = structure["subParts"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+
+        // First part: multipart/alternative with text + html
+        assert_eq!(parts[0]["type"], "multipart/alternative");
+        let alt_parts = parts[0]["subParts"].as_array().unwrap();
+        assert_eq!(alt_parts.len(), 2);
+        assert_eq!(alt_parts[0]["partId"], "textBody");
+        assert_eq!(alt_parts[1]["partId"], "htmlBody");
+
+        // Second part: attachment
+        assert_eq!(parts[1]["blobId"], "Gblob456");
+        assert_eq!(parts[1]["name"], "_DSF1117.jpg");
+
+        // bodyValues should have both text and html
+        let bv = &email["bodyValues"];
+        assert_eq!(bv["textBody"]["value"], "Fallback text");
+        assert_eq!(bv["htmlBody"]["value"], "<h1>Photo</h1>");
+    }
+
+    #[test]
+    fn test_body_structure_multiple_attachments() {
+        let mut email = HashMap::new();
+        let attachments = vec![
+            UploadedAttachment {
+                blob_id: "Ga".into(),
+                filename: "a.pdf".into(),
+                content_type: "application/pdf".into(),
+            },
+            UploadedAttachment {
+                blob_id: "Gb".into(),
+                filename: "b.xlsx".into(),
+                content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .into(),
+            },
+        ];
+        apply_body_structure(&mut email, "docs attached", None, &attachments);
+
+        let parts = email["bodyStructure"]["subParts"].as_array().unwrap();
+        assert_eq!(parts.len(), 3); // text + 2 attachments
+        assert_eq!(parts[1]["blobId"], "Ga");
+        assert_eq!(parts[2]["blobId"], "Gb");
+    }
+
+    // ============ upload_blob mock test ============
+
+    #[tokio::test]
+    async fn test_upload_blob_success() {
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock the upload endpoint — matches what Fastmail returns
+        Mock::given(method("POST"))
+            .and(header("Content-Type", "image/jpeg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accountId": "test-account",
+                "blobId": "G31e09448268297247a1b215a4ce1e7bc7ee05699",
+                "expires": "2026-04-12T15:35:44Z",
+                "size": 958081,
+                "type": "image/jpeg"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = JmapClient::new("test-token".to_string());
+        let mut session = create_test_session(vec!["urn:ietf:params:jmap:core"]);
+        session.upload_url = format!("{}/upload/{{accountId}}/", mock_server.uri());
+        client.session = Some(session);
+
+        let blob_id = client
+            .upload_blob(b"fake image data".to_vec(), "image/jpeg")
+            .await
+            .unwrap();
+        assert_eq!(blob_id, "G31e09448268297247a1b215a4ce1e7bc7ee05699");
+    }
+
+    #[tokio::test]
+    async fn test_upload_blob_413_too_large() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(413).set_body_string("Request Entity Too Large"))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = JmapClient::new("test-token".to_string());
+        let mut session = create_test_session(vec!["urn:ietf:params:jmap:core"]);
+        session.upload_url = format!("{}/upload/{{accountId}}/", mock_server.uri());
+        client.session = Some(session);
+
+        let result = client
+            .upload_blob(b"huge file".to_vec(), "application/pdf")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("413"));
+        assert!(err.contains("Too Large"));
+    }
+
+    #[tokio::test]
+    async fn test_upload_blob_rate_limited() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .mount(&mock_server)
+            .await;
+
+        let mut client = JmapClient::new("test-token".to_string());
+        let mut session = create_test_session(vec!["urn:ietf:params:jmap:core"]);
+        session.upload_url = format!("{}/upload/{{accountId}}/", mock_server.uri());
+        client.session = Some(session);
+
+        let result = client.upload_blob(b"data".to_vec(), "text/plain").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Rate limited"));
     }
 }
