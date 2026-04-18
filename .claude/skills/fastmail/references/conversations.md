@@ -1,9 +1,6 @@
----
-name: fastmail/conversations
-description: fastmail-cli list/get/thread — reading emails and conversations; --compact is the highest-leverage token saving here
----
-
 # fastmail-cli — Reading & Conversations
+
+Reference for `list emails`, `get`, `thread`, and triage (`mark-read`, `move`, `spam`). `thread --compact` is the biggest single token-economy win.
 
 ## Listing
 

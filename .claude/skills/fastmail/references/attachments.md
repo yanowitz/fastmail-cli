@@ -1,9 +1,6 @@
----
-name: fastmail/attachments
-description: fastmail-cli download — save attachments or extract text content from emails
----
-
 # fastmail-cli — Attachments
+
+Reference for `download` — save attachment files or extract text content.
 
 ```bash
 fastmail-cli download EMAIL_ID [-o DIR] [-f raw|json] [--max-size 1M]

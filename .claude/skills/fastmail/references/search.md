@@ -1,9 +1,6 @@
----
-name: fastmail/search
-description: fastmail-cli search — filters, token-economy projection flags (--compact/--fields), and triage/enrichment patterns
----
-
 # fastmail-cli — Search
+
+Reference for `fastmail-cli search`: filters, projection flags, triage/enrichment patterns.
 
 Filters are ANDed. Output is `{success, data: [emails...]}`.
 

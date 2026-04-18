@@ -1,8 +1,3 @@
----
-name: fastmail/contacts
-description: fastmail-cli contacts — CardDAV config, list and search contacts
----
-
 # fastmail-cli — Contacts
 
 CardDAV. Needs separate credentials from the JMAP token:

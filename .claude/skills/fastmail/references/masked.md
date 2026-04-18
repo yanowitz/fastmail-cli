@@ -1,8 +1,3 @@
----
-name: fastmail/masked
-description: fastmail-cli masked — create / list / enable / disable / delete masked email addresses
----
-
 # fastmail-cli — Masked Email
 
 Fastmail's disposable addresses. Each one forwards to your real inbox and can be turned off or deleted independently.

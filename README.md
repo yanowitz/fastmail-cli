@@ -379,21 +379,20 @@ Measured reduction on a real account:
 
 ## Claude Code Skills
 
-If you're using [Claude Code](https://claude.ai/claude-code), this repo ships skills that teach agents how to use the CLI — no need to explain flags or workflows manually.
+If you're using [Claude Code](https://claude.ai/claude-code), this repo ships a skill that teaches agents how to use the CLI — no need to explain flags or workflows manually.
 
-Copy the skills into your project's `.claude/skills/` directory (or anywhere Claude Code loads skills from), then invoke them:
+Copy the `fastmail` skill directory into your project's (or user-level) `.claude/skills/`:
 
-```
-/fastmail              # full command reference + common patterns
-/fastmail/search       # search filters, date ranges, workflows
-/fastmail/compose      # send, reply, forward, drafts, identities
-/fastmail/conversations # list, get, thread, mark-read, triage
-/fastmail/attachments  # download, raw vs json, text extraction
-/fastmail/masked       # masked email CRUD
-/fastmail/contacts     # CardDAV setup, list/search
+```bash
+cp -r .claude/skills/fastmail ~/.claude/skills/
+# or per-project:
+cp -r .claude/skills/fastmail /path/to/your/project/.claude/skills/
 ```
 
-Skills are in `.claude/skills/` in this repo. Each one includes concrete examples and agent-oriented workflow patterns.
+The skill auto-triggers when Claude sees Fastmail/email-related requests. Structure:
+
+- `fastmail/SKILL.md` — command reference, common workflows, and token-economy guidance; loaded on trigger.
+- `fastmail/{search,conversations,compose,attachments,masked,contacts}.md` — on-demand references. Claude reads them when the task calls for more detail than `SKILL.md` provides.
 
 ## MCP Server (Claude Integration)
 

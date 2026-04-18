@@ -1,6 +1,6 @@
 ---
 name: fastmail
-description: fastmail-cli reference — all commands, flags, token-economy flags (--compact/--fields), and common agent workflows
+description: Use when the user mentions Fastmail, fastmail-cli, or needs to send, search, read, reply, forward, or triage email from the CLI. Also covers Fastmail contacts (CardDAV), masked email addresses, and email attachments.
 ---
 
 # fastmail-cli
@@ -29,7 +29,7 @@ Four commands accept output-projection flags: `search`, `list emails`, `get`, `t
 
 `--compact` and `--fields` are mutually exclusive. `id` is always included.
 
-Measured shrinkage on this account:
+Measured shrinkage on a real account:
 
 | Call | Default | `--compact` | `--fields id,subject,from,receivedAt` |
 |---|---|---|---|
@@ -62,7 +62,7 @@ fastmail-cli thread EMAIL_ID [--compact | --fields CSV]
 fastmail-cli search [FILTERS] [--compact | --fields CSV] [-l LIMIT]
 ```
 
-Filters: `--text/-t`, `--from`, `--to`, `--cc`, `--bcc`, `--subject`, `--body`, `--mailbox/-m`, `--before`, `--after` (ISO 8601), `--unread`, `--flagged`, `--has-attachment`, `--min-size`, `--max-size`. All ANDed. See `/fastmail/search`.
+Filters: `--text/-t`, `--from`, `--to`, `--cc`, `--bcc`, `--subject`, `--body`, `--mailbox/-m`, `--before`, `--after` (ISO 8601), `--unread`, `--flagged`, `--has-attachment`, `--min-size`, `--max-size`. All ANDed. For filter-combination patterns, see [`references/search.md`](references/search.md).
 
 ### Compose
 
@@ -118,11 +118,35 @@ fastmail-cli send --to x@y.com --subject S --body B --draft
 
 ---
 
-## Subcommand Skills
+## Piping between commands
 
-- `/fastmail/search` — filter combinations and token-economy workflows
-- `/fastmail/compose` — send, reply, forward, drafts, identities
-- `/fastmail/conversations` — threading, listing, reading (incl. `thread --compact`)
-- `/fastmail/attachments` — download and extract
-- `/fastmail/masked` — masked email management
-- `/fastmail/contacts` — contact search
+Reading a JSON response directly is usually enough. `jq` only matters when you need to **feed a value into the next shell command**. When you do, pair `--fields id` with `jq -r` to keep the pipeline cheap:
+
+```bash
+# Reply to the first unread match
+fastmail-cli reply \
+  $(fastmail-cli search --from boss@ --unread --fields id | jq -r '.data[0].id') \
+  --body "On it."
+
+# Bulk action over many matches
+for id in $(fastmail-cli search --from newsletter@ --before 2024-01-01 --fields id | jq -r '.data[].id'); do
+  fastmail-cli move "$id" --to Archive
+done
+```
+
+For inspection (counts, summaries, subject lookups), just run the command and read the JSON — no jq required.
+
+---
+
+## On-demand references
+
+When the task calls for more detail than `SKILL.md` provides, read the matching file in `references/`:
+
+- [`references/search.md`](references/search.md) — filter combinations and projection-flag workflows
+- [`references/conversations.md`](references/conversations.md) — listing, reading, threading (especially `thread --compact`)
+- [`references/compose.md`](references/compose.md) — send, reply, forward, drafts, identities
+- [`references/attachments.md`](references/attachments.md) — download, text extraction, raw vs json
+- [`references/masked.md`](references/masked.md) — masked email CRUD
+- [`references/contacts.md`](references/contacts.md) — CardDAV setup and contact search
+
+These load only when Claude reads them — not automatically on skill invocation.

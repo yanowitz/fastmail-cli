@@ -1,9 +1,6 @@
----
-name: fastmail/compose
-description: fastmail-cli send / reply / forward / draft — flags, identities, compose patterns
----
-
 # fastmail-cli — Compose
+
+Reference for `send`, `reply`, `forward`, drafts, and sender identities.
 
 ## Identities
 
