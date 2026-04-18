@@ -360,6 +360,72 @@ pub fn resolve_html(
     Ok(None)
 }
 
+/// Convert HTML to plain text with best-effort formatting.
+///
+/// Used as the fallback for `--compact` body extraction when an email has no
+/// `text/plain` part. Not a full HTML parser — handles tags, common entities,
+/// and whitespace collapse. Good enough for agents reading the gist.
+pub fn strip_html_to_text(html: &str) -> String {
+    let mut s = html.to_string();
+    for pat in [
+        "</p>", "</P>", "</div>", "</DIV>", "</li>", "</LI>", "</tr>", "</TR>", "</h1>", "</h2>",
+        "</h3>", "</h4>", "</h5>", "</h6>", "</H1>", "</H2>", "</H3>", "</H4>", "</H5>", "</H6>",
+    ] {
+        s = s.replace(pat, "\n");
+    }
+    for pat in ["<br>", "<br/>", "<br />", "<BR>", "<BR/>", "<BR />"] {
+        s = s.replace(pat, "\n");
+    }
+
+    let mut stripped = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => stripped.push(c),
+            _ => {}
+        }
+    }
+
+    let decoded = stripped
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'");
+
+    let mut out = String::with_capacity(decoded.len());
+    let mut prev_blank = true;
+    for line in decoded.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_blank {
+                out.push('\n');
+                prev_blank = true;
+            }
+            continue;
+        }
+        let mut ws_prev = false;
+        for c in trimmed.chars() {
+            if c.is_whitespace() {
+                if !ws_prev {
+                    out.push(' ');
+                }
+                ws_prev = true;
+            } else {
+                out.push(c);
+                ws_prev = false;
+            }
+        }
+        out.push('\n');
+        prev_blank = false;
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

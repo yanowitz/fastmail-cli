@@ -182,6 +182,97 @@ impl Email {
     }
 }
 
+/// Agent-friendly summary of an [`Email`] used by `--compact`.
+///
+/// Drops JMAP internals (`blobId`, `mailboxIds`, raw `keywords`) and always-null
+/// fields, derives `unread`/`flagged` from keywords, flattens `bodyValues` into
+/// a single plain-text string (HTML stripped if no text part exists), and
+/// summarizes attachments to `{name, contentType, size}`. Body fields are only
+/// populated when the source `Email` carried body data — search/list hits have
+/// `text_body = None` and `attachments = None`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactEmail {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cc: Option<Vec<EmailAddress>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub received_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+    pub has_attachment: bool,
+    pub size: u64,
+    pub unread: bool,
+    pub flagged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<CompactAttachment>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactAttachment {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
+impl From<Email> for CompactEmail {
+    fn from(e: Email) -> Self {
+        let unread = e.is_unread();
+        let flagged = e.is_flagged();
+        let text_body = flatten_text_body(&e);
+        let attachments = e.attachments.as_ref().map(|atts| {
+            atts.iter()
+                .map(|a| CompactAttachment {
+                    name: a.name.clone(),
+                    content_type: a.content_type.clone(),
+                    size: a.size,
+                })
+                .collect()
+        });
+        Self {
+            id: e.id,
+            thread_id: e.thread_id,
+            subject: e.subject,
+            from: e.from,
+            to: e.to,
+            cc: e.cc,
+            received_at: e.received_at,
+            preview: e.preview,
+            has_attachment: e.has_attachment,
+            size: e.size,
+            unread,
+            flagged,
+            text_body,
+            attachments,
+        }
+    }
+}
+
+/// Extract flattened plain text from an `Email`, falling back to
+/// HTML-stripped content when no `text/plain` part exists.
+fn flatten_text_body(email: &Email) -> Option<String> {
+    if let Some(text) = email.text_content() {
+        return Some(text.to_string());
+    }
+    email
+        .html_content()
+        .map(crate::util::strip_html_to_text)
+        .filter(|s| !s.is_empty())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {

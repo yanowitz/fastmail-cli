@@ -548,8 +548,29 @@ impl JmapClient {
     }
 
     #[instrument(skip(self))]
-    pub async fn list_emails(&self, mailbox_id: &str, limit: u32) -> Result<Vec<Email>> {
+    pub async fn list_emails(
+        &self,
+        mailbox_id: &str,
+        limit: u32,
+        properties: Option<&[&str]>,
+    ) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
+
+        const DEFAULT_PROPS: &[&str] = &[
+            "id",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "size",
+            "receivedAt",
+            "from",
+            "to",
+            "cc",
+            "subject",
+            "preview",
+            "hasAttachment",
+        ];
+        let props = properties.unwrap_or(DEFAULT_PROPS);
 
         let responses = self
             .request(vec![
@@ -572,11 +593,7 @@ impl JmapClient {
                             "name": "Email/query",
                             "path": "/ids"
                         },
-                        "properties": [
-                            "id", "threadId", "mailboxIds", "keywords",
-                            "size", "receivedAt", "from", "to", "cc",
-                            "subject", "preview", "hasAttachment"
-                        ]
+                        "properties": props
                     },
                     "g0"
                 ]),
@@ -590,8 +607,40 @@ impl JmapClient {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_email(&self, email_id: &str) -> Result<Email> {
+    pub async fn get_email(
+        &self,
+        email_id: &str,
+        properties: Option<&[&str]>,
+        fetch_body_values: bool,
+    ) -> Result<Email> {
         let account_id = self.account_id()?;
+
+        const DEFAULT_PROPS: &[&str] = &[
+            "id",
+            "blobId",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "size",
+            "receivedAt",
+            "messageId",
+            "inReplyTo",
+            "references",
+            "from",
+            "to",
+            "cc",
+            "bcc",
+            "replyTo",
+            "subject",
+            "sentAt",
+            "preview",
+            "hasAttachment",
+            "textBody",
+            "htmlBody",
+            "attachments",
+            "bodyValues",
+        ];
+        let props = properties.unwrap_or(DEFAULT_PROPS);
 
         let responses = self
             .request(vec![json!([
@@ -599,15 +648,9 @@ impl JmapClient {
                 {
                     "accountId": account_id,
                     "ids": [email_id],
-                    "properties": [
-                        "id", "blobId", "threadId", "mailboxIds", "keywords",
-                        "size", "receivedAt", "messageId", "inReplyTo", "references",
-                        "from", "to", "cc", "bcc", "replyTo", "subject", "sentAt",
-                        "preview", "hasAttachment", "textBody", "htmlBody", "attachments",
-                        "bodyValues"
-                    ],
-                    "fetchTextBodyValues": true,
-                    "fetchHTMLBodyValues": true
+                    "properties": props,
+                    "fetchTextBodyValues": fetch_body_values,
+                    "fetchHTMLBodyValues": fetch_body_values
                 },
                 "g0"
             ])])
@@ -628,11 +671,20 @@ impl JmapClient {
 
     /// Get all emails in a thread
     #[instrument(skip(self))]
-    pub async fn get_thread(&self, email_id: &str) -> Result<Vec<Email>> {
+    pub async fn get_thread(
+        &self,
+        email_id: &str,
+        properties: Option<&[&str]>,
+        fetch_body_values: bool,
+    ) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
 
-        // First get the email to find its threadId
-        let email = self.get_email(email_id).await?;
+        // First look up the email just to get its threadId. Always uses a
+        // minimal fetch — we don't care about the first email's properties
+        // at this stage.
+        let email = self
+            .get_email(email_id, Some(&["id", "threadId"]), false)
+            .await?;
         let thread_id = email
             .thread_id
             .ok_or_else(|| Error::Config("Email has no thread ID".into()))?;
@@ -664,20 +716,34 @@ impl JmapClient {
             .next()
             .ok_or_else(|| Error::Config("Thread not found".into()))?;
 
-        // Now get all emails in the thread
+        const DEFAULT_PROPS: &[&str] = &[
+            "id",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "size",
+            "receivedAt",
+            "from",
+            "to",
+            "cc",
+            "subject",
+            "preview",
+            "hasAttachment",
+            "textBody",
+            "htmlBody",
+            "bodyValues",
+        ];
+        let props = properties.unwrap_or(DEFAULT_PROPS);
+
         let responses = self
             .request(vec![json!([
                 "Email/get",
                 {
                     "accountId": account_id,
                     "ids": thread.email_ids,
-                    "properties": [
-                        "id", "threadId", "mailboxIds", "keywords",
-                        "size", "receivedAt", "from", "to", "cc",
-                        "subject", "preview", "hasAttachment", "textBody", "htmlBody", "bodyValues"
-                    ],
-                    "fetchTextBodyValues": true,
-                    "fetchHTMLBodyValues": true
+                    "properties": props,
+                    "fetchTextBodyValues": fetch_body_values,
+                    "fetchHTMLBodyValues": fetch_body_values
                 },
                 "e0"
             ])])
@@ -696,6 +762,7 @@ impl JmapClient {
         filter: &SearchFilter,
         mailbox_id: Option<&str>,
         limit: u32,
+        properties: Option<&[&str]>,
     ) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
 
@@ -759,6 +826,22 @@ impl JmapClient {
             jmap_filter["hasKeyword"] = json!("$flagged");
         }
 
+        const DEFAULT_PROPS: &[&str] = &[
+            "id",
+            "threadId",
+            "mailboxIds",
+            "keywords",
+            "size",
+            "receivedAt",
+            "from",
+            "to",
+            "cc",
+            "subject",
+            "preview",
+            "hasAttachment",
+        ];
+        let props = properties.unwrap_or(DEFAULT_PROPS);
+
         let responses = self
             .request(vec![
                 json!([
@@ -780,11 +863,7 @@ impl JmapClient {
                             "name": "Email/query",
                             "path": "/ids"
                         },
-                        "properties": [
-                            "id", "threadId", "mailboxIds", "keywords",
-                            "size", "receivedAt", "from", "to", "cc",
-                            "subject", "preview", "hasAttachment"
-                        ]
+                        "properties": props
                     },
                     "g0"
                 ]),

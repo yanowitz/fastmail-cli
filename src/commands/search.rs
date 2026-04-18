@@ -1,5 +1,6 @@
 use crate::jmap::authenticated_client;
 use crate::models::Output;
+use crate::projection::{Projection, project_many};
 
 /// Search filter matching JMAP Email/query FilterCondition
 #[derive(Debug, Default)]
@@ -21,7 +22,11 @@ pub struct SearchFilter {
     pub flagged: bool,
 }
 
-pub async fn search(filter: SearchFilter, limit: u32) -> anyhow::Result<()> {
+pub async fn search(
+    filter: SearchFilter,
+    limit: u32,
+    projection: Projection,
+) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
 
     // Resolve mailbox name to ID if specified
@@ -31,10 +36,13 @@ pub async fn search(filter: SearchFilter, limit: u32) -> anyhow::Result<()> {
         None
     };
 
+    let props = projection.jmap_properties(false);
+    let props_slice = props.as_deref();
+
     let emails = client
-        .search_emails_filtered(&filter, mailbox_id.as_deref(), limit)
+        .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, props_slice)
         .await?;
-    Output::success(emails).print();
+    Output::success(project_many(emails, &projection)).print();
 
     Ok(())
 }

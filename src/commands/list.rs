@@ -1,5 +1,6 @@
 use crate::jmap::authenticated_client;
-use crate::models::{Email, Mailbox, Output};
+use crate::models::{Mailbox, Output};
+use crate::projection::{Projection, project_many};
 
 pub async fn list_mailboxes() -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
@@ -10,19 +11,25 @@ pub async fn list_mailboxes() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_emails(mailbox: &str, limit: u32) -> anyhow::Result<()> {
+pub async fn list_emails(mailbox: &str, limit: u32, projection: Projection) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
 
     let mailbox = client.find_mailbox(mailbox).await?;
-    let emails = client.list_emails(&mailbox.id, limit).await?;
+    let props = projection.jmap_properties(false);
+    let props_slice = props.as_deref();
+    let emails = client.list_emails(&mailbox.id, limit, props_slice).await?;
 
     #[derive(serde::Serialize)]
     struct EmailListResponse {
         mailbox: Mailbox,
-        emails: Vec<Email>,
+        emails: Vec<serde_json::Value>,
     }
 
-    Output::success(EmailListResponse { mailbox, emails }).print();
+    Output::success(EmailListResponse {
+        mailbox,
+        emails: project_many(emails, &projection),
+    })
+    .print();
 
     Ok(())
 }

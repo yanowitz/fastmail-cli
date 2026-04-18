@@ -11,7 +11,7 @@ pub async fn forward(
     let mut client = authenticated_client().await?;
     let draft = params.draft;
 
-    let original = client.get_email(email_id).await?;
+    let original = client.get_email(email_id, None, true).await?;
 
     let new_email_id = client
         .forward_email(&original, parse_addresses(to), body, params)

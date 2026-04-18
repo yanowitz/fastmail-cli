@@ -38,7 +38,7 @@ impl QueryRoot {
         let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
-        let emails = client.list_emails(&mb.id, limit).await?;
+        let emails = client.list_emails(&mb.id, limit, None).await?;
         Ok(emails.into_iter().map(Into::into).collect())
     }
 
@@ -51,7 +51,7 @@ impl QueryRoot {
     ) -> Result<Option<GqlEmail>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        match client.get_email(&id).await {
+        match client.get_email(&id, None, true).await {
             Ok(email) => Ok(Some(GqlEmail(email))),
             Err(crate::error::Error::EmailNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
@@ -67,7 +67,7 @@ impl QueryRoot {
     ) -> Result<GqlThread> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let mut emails = client.get_thread(&email_id).await?;
+        let mut emails = client.get_thread(&email_id, None, true).await?;
         emails.sort_by(|a, b| a.received_at.cmp(&b.received_at));
         let total = emails.len();
         Ok(GqlThread { emails, total })
@@ -123,7 +123,7 @@ impl QueryRoot {
         };
 
         let emails = client
-            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit)
+            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, None)
             .await?;
         Ok(emails.into_iter().map(Into::into).collect())
     }
@@ -136,7 +136,7 @@ impl QueryRoot {
     ) -> Result<Vec<GqlAttachment>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         Ok(GqlEmail(email).make_attachments())
     }
 
@@ -149,7 +149,7 @@ impl QueryRoot {
     ) -> Result<Option<GqlAttachment>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         Ok(GqlEmail(email)
             .make_attachments()
             .into_iter()
