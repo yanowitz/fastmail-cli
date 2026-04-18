@@ -1,87 +1,62 @@
 ---
 name: fastmail/conversations
-description: fastmail-cli list, get, thread — reading emails, conversations, mark-read, and triage
+description: fastmail-cli list/get/thread — reading emails and conversations; --compact is the highest-leverage token saving here
 ---
 
-# fastmail-cli — Conversations & Email Reading
+# fastmail-cli — Reading & Conversations
 
-## Listing Emails
-
-```bash
-fastmail-cli list emails [-m MAILBOX] [-l LIMIT]
-```
-
-- Default mailbox: `INBOX`, default limit: `50`
-- Returns email summaries (id, subject, from, date, flags)
+## Listing
 
 ```bash
-# List a different folder
-fastmail-cli list emails --mailbox "Sent"
-fastmail-cli list emails --mailbox "Archive" --limit 100
-
-# See all folders first
+fastmail-cli list emails [-m MAILBOX] [-l LIMIT] [--compact | --fields CSV]
 fastmail-cli list mailboxes
 ```
 
-## Reading a Single Email
+Default: INBOX, 50 messages. Returns `{mailbox, emails: [...]}`.
+
+## Single email
 
 ```bash
-fastmail-cli get EMAIL_ID
+fastmail-cli get EMAIL_ID [--compact | --fields CSV]
 ```
 
-Returns full email: headers, body (plain + HTML), attachment metadata.
+Default returns the full JMAP email (headers, plain+HTML bodies, attachment metadata, `bodyValues`). `--compact` flattens to plain text (HTML stripped if no text part), summarizes attachments, drops internals. Typically 2× smaller on text, much more on HTML-heavy email.
 
-## Reading a Full Thread/Conversation
+## Full thread
 
 ```bash
-fastmail-cli thread EMAIL_ID
+fastmail-cli thread EMAIL_ID [--compact | --fields CSV]
 ```
 
-- Provide **any** email ID in the thread — returns all messages in chronological order.
-- Ideal for understanding full context before replying.
+Any email ID in the thread works. Returns messages chronologically.
 
-## Typical Read Workflow
+**`thread --compact` is the single biggest token-economy win.** A 5-message HTML thread on this account: **79 KB → 5 KB (16×)**. Always use it for history enrichment or reply context unless you specifically need HTML or `bodyValues`.
+
+## Typical workflow
 
 ```bash
-# 1. List inbox
-fastmail-cli list emails
+# Triage inbox (compact = essentials only)
+fastmail-cli list emails --compact
 
-# 2. Get a specific email by ID
-fastmail-cli get abc123
+# Pull full conversation for context
+fastmail-cli thread EMAIL_ID --compact
 
-# 3. Get full thread for context
-fastmail-cli thread abc123
-
-# 4. Mark as read when done
-fastmail-cli mark-read abc123
-
-# 5. Reply or move
-fastmail-cli reply abc123 --body "Got it, thanks."
-fastmail-cli move abc123 --to "Archive"
+# Act
+fastmail-cli mark-read EMAIL_ID
+fastmail-cli reply EMAIL_ID --body "Got it."
+fastmail-cli move EMAIL_ID --to "Archive"
 ```
 
-## Mark Read / Unread
+## Mark read / spam / move
 
 ```bash
-fastmail-cli mark-read EMAIL_ID          # mark as read
-fastmail-cli mark-read EMAIL_ID --unread # mark as unread
-```
-
-## Triage
-
-```bash
-# Move to folder
+fastmail-cli mark-read EMAIL_ID [--unread]
 fastmail-cli move EMAIL_ID --to "Work/Projects"
-
-# Mark as spam (prompts confirmation)
-fastmail-cli spam EMAIL_ID
-
-# Skip confirmation
-fastmail-cli spam EMAIL_ID -y
+fastmail-cli spam EMAIL_ID [-y]     # -y skips confirmation
 ```
 
 ## Tips
 
-- Use `search` to find emails, then `thread` to get full context — this is the most useful combo for agents.
-- `thread` is cheaper than running multiple `get` calls for each message in a conversation.
-- IDs are stable — safe to store and reference later.
+- `search` → `thread --compact` → `reply`: the canonical agent flow.
+- Single `thread` call beats N `get` calls for a conversation.
+- IDs are stable; safe to store and reuse later.

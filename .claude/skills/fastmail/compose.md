@@ -1,96 +1,48 @@
 ---
 name: fastmail/compose
-description: fastmail-cli send, reply, forward, draft — flags, identities, and compose patterns
+description: fastmail-cli send / reply / forward / draft — flags, identities, compose patterns
 ---
 
-# fastmail-cli — Compose (Send / Reply / Forward / Draft)
+# fastmail-cli — Compose
 
 ## Identities
 
-Before composing, check available sender identities:
+`--from` on send/reply/forward takes an identity email. Must match one returned by `list identities` — arbitrary addresses won't work.
 
 ```bash
 fastmail-cli list identities
 ```
 
-Use the identity email string with `--from` on any compose command.
-
----
-
-## Send
+## Send / Reply / Forward
 
 ```bash
-fastmail-cli send \
-  --to "alice@example.com,bob@example.com" \
-  --subject "Subject line" \
-  --body "Plain text body" \
-  [--cc "cc@example.com"] \
-  [--bcc "bcc@example.com"] \
-  [--from "alias@yourdomain.com"] \
-  [--draft]
+fastmail-cli send --to ADDR --subject S --body B [--cc] [--bcc] [--from] [--draft]
+fastmail-cli reply EMAIL_ID --body B [--all] [--cc] [--bcc] [--from] [--draft]
+fastmail-cli forward EMAIL_ID --to ADDR [--body] [--cc] [--bcc] [--from] [--draft]
 ```
 
-- `--to`, `--subject`, `--body` are required.
-- Multiple recipients: comma-separated string.
+- Addresses are comma-separated.
 - `--draft` saves to Drafts instead of sending.
+- `reply --all` is reply-all. Threading headers (`In-Reply-To`, `References`) are set automatically.
+- `forward --body` prepends a note above the forwarded content.
+- Body is plain text. For HTML, compose in Fastmail web and use `--draft` to stage.
 
-## Reply
-
-```bash
-fastmail-cli reply EMAIL_ID \
-  --body "Reply text" \
-  [--all] \
-  [--cc "extra@example.com"] \
-  [--bcc "hidden@example.com"] \
-  [--from "alias@yourdomain.com"] \
-  [--draft]
-```
-
-- `EMAIL_ID` is the email you're replying to (from `list`, `search`, or `thread`).
-- `--all` replies to all recipients (reply-all).
-- Threading headers (`In-Reply-To`, `References`) are set automatically.
-
-## Forward
-
-```bash
-fastmail-cli forward EMAIL_ID \
-  --to "recipient@example.com" \
-  [--body "Here's that email I mentioned..."] \
-  [--cc "cc@example.com"] \
-  [--bcc "bcc@example.com"] \
-  [--from "alias@yourdomain.com"] \
-  [--draft]
-```
-
-- `--body` is optional — text appears before the forwarded content.
-
----
-
-## Common Patterns
+## Patterns
 
 ```bash
 # Reply from a specific alias
-fastmail-cli list identities
-fastmail-cli reply abc123 --body "On it." --from work-alias@mydomain.com
+fastmail-cli reply abc123 --body "On it." --from work@mydomain.com
 
-# Reply-all and BCC someone for records
+# Reply-all + BCC archive
 fastmail-cli reply abc123 --body "Thanks all." --all --bcc archive@mydomain.com
 
-# Save a draft to review before sending
-fastmail-cli send --to x@y.com --subject "Careful email" --body "..." --draft
+# Draft for review
+fastmail-cli send --to x@y.com --subject S --body "..." --draft
 
-# Forward with context note
-fastmail-cli forward abc123 --to manager@company.com --body "FYI, see below."
+# Forward with note
+fastmail-cli forward abc123 --to manager@co.com --body "FYI"
 
-# Quick reply inline
-fastmail-cli reply $(fastmail-cli search --from boss@co.com --unread | jq -r '.data[0].id') \
+# Quick reply to first hit
+fastmail-cli reply $(fastmail-cli search --from boss@co.com --unread --fields id | jq -r '.data[0].id') \
   --body "Done."
 ```
-
----
-
-## Notes
-
-- Body is plain text only.
-- For HTML or complex formatting, compose in Fastmail web and use `--draft` to stage.
-- `--from` must match an identity returned by `list identities` — arbitrary addresses won't work.

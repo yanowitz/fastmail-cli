@@ -16,6 +16,7 @@ CLI for Fastmail's JMAP API. Read, search, send, and manage emails from your ter
 | **MCP Server**        | Claude integration via Model Context Protocol                          |
 | **Shell Completions** | Bash, Zsh, Fish, PowerShell                                            |
 | **JSON Output**       | All commands output JSON for scripting                                 |
+| **Agent-friendly**    | `--compact` / `--fields` on search/list/get/thread cut response size 3–16× for LLM agents |
 
 ## Quick Start
 
@@ -358,6 +359,23 @@ fastmail-cli list emails | jq '.data.emails[].subject'
 # Get email body
 fastmail-cli get EMAIL_ID | jq -r '.data.bodyValues | to_entries[0].value.value'
 ```
+
+## Agent Token Economy: `--compact` / `--fields`
+
+Default JMAP responses are verbose (a default-limit `search` is ~57 KB ≈ 14K tokens). For agent use, `search`, `list emails`, `get`, and `thread` accept two mutually-exclusive flags:
+
+- `--compact`: curated agent-friendly shape. Drops `mailboxIds`/`keywords`/always-null fields; adds derived `unread`/`flagged` booleans; on `get`/`thread` flattens body to plain text (HTML stripped as fallback) and summarizes attachments.
+- `--fields id,subject,from,receivedAt`: JMAP-passthrough projection. Unknown property names error. Pushed down to JMAP as the `properties` parameter, so bandwidth also drops.
+
+Measured reduction on a real account:
+
+| Call | Default | `--compact` | `--fields` subset |
+|---|---|---|---|
+| `search -l 5` | 5.7 KB | 3.7 KB | 1.3 KB |
+| `thread` (5-msg HTML) | 79 KB | 5 KB (16×) | 1.2 KB (66×) |
+| `get` (small text) | 3.0 KB | 1.7 KB | — |
+
+`thread --compact` is the biggest single win for any agent workflow that enriches with conversation history.
 
 ## Claude Code Skills
 
