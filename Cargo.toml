@@ -1,6 +1,6 @@
 [package]
 name = "fastmail-cli"
-version = "2.2.0"
+version = "2.2.1"
 edition = "2024"
 description = "CLI for Fastmail's JMAP API"
 repository = "https://github.com/radiosilence/fastmail-cli"
@@ -46,6 +46,8 @@ toml = "0.8"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 roxmltree = "0.21.1"
+percent-encoding = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
