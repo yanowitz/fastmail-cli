@@ -609,10 +609,10 @@ async fn main() {
                 commands::search(
                     commands::SearchFilter {
                         text,
-                        from,
-                        to,
-                        cc,
-                        bcc,
+                        from: commands::split_address_filter(from),
+                        to: commands::split_address_filter(to),
+                        cc: commands::split_address_filter(cc),
+                        bcc: commands::split_address_filter(bcc),
                         subject,
                         body,
                         mailbox,

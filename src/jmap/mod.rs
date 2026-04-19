@@ -355,6 +355,100 @@ fn dedup_by_email(addrs: &mut Vec<EmailAddress>) {
     addrs.retain(|a| seen.insert(a.email.to_lowercase()));
 }
 
+/// Translate a [`SearchFilter`] and optional mailbox ID into a JMAP
+/// `Email/query` filter tree.
+///
+/// Single-value fields collapse into a flat FilterCondition object
+/// (`{from: "x", subject: "y"}`). Address fields (`from`/`to`/`cc`/`bcc`)
+/// with >1 entries become a JMAP OR FilterOperator on that field. When
+/// both a flat condition and one or more OR operators exist, they combine
+/// under a top-level AND. Empty filter → `{}`.
+///
+/// Preserving the flat shape for single-value-only calls keeps the wire
+/// format byte-identical to pre-multi-value behaviour for existing
+/// consumers.
+fn build_jmap_filter(filter: &SearchFilter, mailbox_id: Option<&str>) -> Value {
+    let mut flat = serde_json::Map::new();
+    let mut or_conditions: Vec<Value> = Vec::new();
+
+    if let Some(t) = &filter.text {
+        flat.insert("text".into(), json!(t));
+    }
+    if let Some(s) = &filter.subject {
+        flat.insert("subject".into(), json!(s));
+    }
+    if let Some(b) = &filter.body {
+        flat.insert("body".into(), json!(b));
+    }
+    if let Some(m) = mailbox_id {
+        flat.insert("inMailbox".into(), json!(m));
+    }
+    if filter.has_attachment {
+        flat.insert("hasAttachment".into(), json!(true));
+    }
+    if let Some(min) = filter.min_size {
+        flat.insert("minSize".into(), json!(min));
+    }
+    if let Some(max) = filter.max_size {
+        flat.insert("maxSize".into(), json!(max));
+    }
+    if let Some(before) = &filter.before {
+        let date = if before.contains('T') {
+            before.clone()
+        } else {
+            format!("{before}T00:00:00Z")
+        };
+        flat.insert("before".into(), json!(date));
+    }
+    if let Some(after) = &filter.after {
+        let date = if after.contains('T') {
+            after.clone()
+        } else {
+            format!("{after}T00:00:00Z")
+        };
+        flat.insert("after".into(), json!(date));
+    }
+    if filter.unread {
+        flat.insert("notKeyword".into(), json!("$seen"));
+    }
+    if filter.flagged {
+        flat.insert("hasKeyword".into(), json!("$flagged"));
+    }
+
+    // Address fields: single-value → flat; multi-value → OR FilterOperator.
+    for (name, values) in [
+        ("from", &filter.from),
+        ("to", &filter.to),
+        ("cc", &filter.cc),
+        ("bcc", &filter.bcc),
+    ] {
+        match values.len() {
+            0 => {}
+            1 => {
+                flat.insert(name.into(), json!(&values[0]));
+            }
+            _ => {
+                let conds: Vec<Value> = values.iter().map(|v| json!({ name: v })).collect();
+                or_conditions.push(json!({ "operator": "OR", "conditions": conds }));
+            }
+        }
+    }
+
+    match (flat.is_empty(), or_conditions.len()) {
+        (true, 0) => json!({}),
+        (false, 0) => Value::Object(flat),
+        (true, 1) => or_conditions.into_iter().next().unwrap(),
+        _ => {
+            let mut all: Vec<Value> = Vec::with_capacity(or_conditions.len() + 1);
+            if !flat.is_empty() {
+                all.push(Value::Object(flat));
+            }
+            all.extend(or_conditions);
+            json!({ "operator": "AND", "conditions": all })
+        }
+    }
+}
+
 impl JmapClient {
     pub fn new(token: String) -> Self {
         let client = Client::builder()
@@ -782,66 +876,7 @@ impl JmapClient {
         properties: Option<&[&str]>,
     ) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
-
-        // Build JMAP filter object
-        let mut jmap_filter = json!({});
-
-        if let Some(ref text) = filter.text {
-            jmap_filter["text"] = json!(text);
-        }
-        if let Some(ref from) = filter.from {
-            jmap_filter["from"] = json!(from);
-        }
-        if let Some(ref to) = filter.to {
-            jmap_filter["to"] = json!(to);
-        }
-        if let Some(ref cc) = filter.cc {
-            jmap_filter["cc"] = json!(cc);
-        }
-        if let Some(ref bcc) = filter.bcc {
-            jmap_filter["bcc"] = json!(bcc);
-        }
-        if let Some(ref subject) = filter.subject {
-            jmap_filter["subject"] = json!(subject);
-        }
-        if let Some(ref body) = filter.body {
-            jmap_filter["body"] = json!(body);
-        }
-        if let Some(mailbox) = mailbox_id {
-            jmap_filter["inMailbox"] = json!(mailbox);
-        }
-        if filter.has_attachment {
-            jmap_filter["hasAttachment"] = json!(true);
-        }
-        if let Some(min_size) = filter.min_size {
-            jmap_filter["minSize"] = json!(min_size);
-        }
-        if let Some(max_size) = filter.max_size {
-            jmap_filter["maxSize"] = json!(max_size);
-        }
-        if let Some(ref before) = filter.before {
-            // Normalize date to ISO 8601 if needed
-            let date = if before.contains('T') {
-                before.clone()
-            } else {
-                format!("{}T00:00:00Z", before)
-            };
-            jmap_filter["before"] = json!(date);
-        }
-        if let Some(ref after) = filter.after {
-            let date = if after.contains('T') {
-                after.clone()
-            } else {
-                format!("{}T00:00:00Z", after)
-            };
-            jmap_filter["after"] = json!(date);
-        }
-        if filter.unread {
-            jmap_filter["notKeyword"] = json!("$seen");
-        }
-        if filter.flagged {
-            jmap_filter["hasKeyword"] = json!("$flagged");
-        }
+        let jmap_filter = build_jmap_filter(filter, mailbox_id);
 
         const DEFAULT_PROPS: &[&str] = &[
             "id",
@@ -2138,5 +2173,73 @@ mod tests {
         client.cached_mailboxes = Some(vec![test_mailbox("A", "Inbox", Some("inbox"))]);
         let err = client.find_mailbox_by_role("sent").await.unwrap_err();
         assert!(err.to_string().contains("role=sent"));
+    }
+
+    fn filter_with_from(values: Vec<&str>) -> SearchFilter {
+        SearchFilter {
+            from: values.into_iter().map(String::from).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_filter_single_value_flat_shape() {
+        // Single-value inputs must produce the flat FilterCondition shape
+        // used before multi-value support — backwards compat on the wire.
+        let f = SearchFilter {
+            from: vec!["a@x.com".into()],
+            subject: Some("invoice".into()),
+            ..Default::default()
+        };
+        let v = build_jmap_filter(&f, None);
+        assert_eq!(v["from"], "a@x.com");
+        assert_eq!(v["subject"], "invoice");
+        assert!(v.get("operator").is_none());
+    }
+
+    #[test]
+    fn build_filter_multi_from_becomes_or_operator() {
+        let f = filter_with_from(vec!["a@x.com", "b@y.com"]);
+        let v = build_jmap_filter(&f, None);
+        assert_eq!(v["operator"], "OR");
+        let conds = v["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0]["from"], "a@x.com");
+        assert_eq!(conds[1]["from"], "b@y.com");
+    }
+
+    #[test]
+    fn build_filter_multi_from_and_flat_fields_wrap_in_and() {
+        let f = SearchFilter {
+            from: vec!["a@x.com".into(), "b@y.com".into()],
+            subject: Some("flight".into()),
+            ..Default::default()
+        };
+        let v = build_jmap_filter(&f, None);
+        assert_eq!(v["operator"], "AND");
+        let conds = v["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert_eq!(conds[0]["subject"], "flight");
+        assert_eq!(conds[1]["operator"], "OR");
+    }
+
+    #[test]
+    fn build_filter_two_multi_fields_both_wrapped_in_and() {
+        let f = SearchFilter {
+            from: vec!["a@x".into(), "b@y".into()],
+            to: vec!["c@z".into(), "d@w".into()],
+            ..Default::default()
+        };
+        let v = build_jmap_filter(&f, None);
+        assert_eq!(v["operator"], "AND");
+        let conds = v["conditions"].as_array().unwrap();
+        assert_eq!(conds.len(), 2);
+        assert!(conds.iter().all(|c| c["operator"] == "OR"));
+    }
+
+    #[test]
+    fn build_filter_empty_filter_is_empty_object() {
+        let v = build_jmap_filter(&SearchFilter::default(), None);
+        assert_eq!(v, json!({}));
     }
 }

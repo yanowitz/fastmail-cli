@@ -100,10 +100,10 @@ impl QueryRoot {
 
         let filter = crate::commands::SearchFilter {
             text: query,
-            from,
-            to,
-            cc,
-            bcc: None,
+            from: from.into_iter().collect(),
+            to: to.into_iter().collect(),
+            cc: cc.into_iter().collect(),
+            bcc: Vec::new(),
             subject,
             body,
             mailbox: None,

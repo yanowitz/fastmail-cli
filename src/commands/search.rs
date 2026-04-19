@@ -2,14 +2,18 @@ use crate::jmap::authenticated_client;
 use crate::models::Output;
 use crate::projection::{Projection, project_many};
 
-/// Search filter matching JMAP Email/query FilterCondition
+/// Search filter matching JMAP Email/query FilterCondition.
+///
+/// Address fields (`from`, `to`, `cc`, `bcc`) are `Vec<String>`: a list with
+/// two or more entries becomes a JMAP OR filter on that field. Single-entry
+/// lists behave identically to the old single-string form on the wire.
 #[derive(Debug, Default)]
 pub struct SearchFilter {
     pub text: Option<String>,
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub cc: Option<String>,
-    pub bcc: Option<String>,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
     pub subject: Option<String>,
     pub body: Option<String>,
     pub mailbox: Option<String>,
@@ -20,6 +24,20 @@ pub struct SearchFilter {
     pub after: Option<String>,
     pub unread: bool,
     pub flagged: bool,
+}
+
+/// Split a `--from`/`--to`/`--cc`/`--bcc` CLI value into individual addresses.
+/// A single-address call passes straight through. Empty entries produced by
+/// trailing commas or extra whitespace are dropped.
+pub fn split_address_filter(raw: Option<String>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 pub async fn search(
