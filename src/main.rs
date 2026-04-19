@@ -170,6 +170,13 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: u32,
 
+        /// Skip this many matches before returning results. Combine with
+        /// `--limit` to page through large result sets. Note: JMAP
+        /// offsets are position-based, so results can shift if the
+        /// mailbox changes between calls.
+        #[arg(long, default_value = "0")]
+        offset: u32,
+
         /// Agent-friendly compact output: drops JMAP internals
         /// (`mailboxIds`, `keywords`) and always-null body fields; adds
         /// derived `unread`/`flagged` bools. ~3× smaller.
@@ -440,6 +447,11 @@ enum ListCommands {
         #[arg(short, long, default_value = "50")]
         limit: u32,
 
+        /// Skip this many emails before returning results. Pair with
+        /// `--limit` to page.
+        #[arg(long, default_value = "0")]
+        offset: u32,
+
         /// Agent-friendly compact output (see `search --compact`).
         #[arg(long, conflicts_with = "fields")]
         compact: bool,
@@ -558,10 +570,11 @@ async fn main() {
             ListCommands::Emails {
                 mailbox,
                 limit,
+                offset,
                 compact,
                 fields,
             } => match resolve_projection(compact, fields.as_deref()) {
-                Ok(proj) => commands::list_emails(&mailbox, limit, proj).await,
+                Ok(proj) => commands::list_emails(&mailbox, limit, offset, proj).await,
                 Err(e) => Err(e),
             },
             ListCommands::Identities => commands::list_identities().await,
@@ -602,6 +615,7 @@ async fn main() {
             unread,
             flagged,
             limit,
+            offset,
             compact,
             fields,
         } => match resolve_projection(compact, fields.as_deref()) {
@@ -625,6 +639,7 @@ async fn main() {
                         flagged,
                     },
                     limit,
+                    offset,
                     proj,
                 )
                 .await

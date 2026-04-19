@@ -38,7 +38,7 @@ impl QueryRoot {
         let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
-        let page = client.list_emails(&mb.id, limit, None).await?;
+        let page = client.list_emails(&mb.id, limit, 0, None).await?;
         Ok(page.emails.into_iter().map(Into::into).collect())
     }
 
@@ -123,7 +123,7 @@ impl QueryRoot {
         };
 
         let page = client
-            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, None)
+            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, 0, None)
             .await?;
         Ok(page.emails.into_iter().map(Into::into).collect())
     }

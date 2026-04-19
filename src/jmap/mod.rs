@@ -677,6 +677,7 @@ impl JmapClient {
         &self,
         mailbox_id: &str,
         limit: u32,
+        offset: u32,
         properties: Option<&[&str]>,
     ) -> Result<EmailPage> {
         let account_id = self.account_id()?;
@@ -705,7 +706,8 @@ impl JmapClient {
                         "accountId": account_id,
                         "filter": { "inMailbox": mailbox_id },
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit
+                        "limit": limit,
+                        "position": offset
                     },
                     "q0"
                 ]),
@@ -892,6 +894,7 @@ impl JmapClient {
         filter: &SearchFilter,
         mailbox_id: Option<&str>,
         limit: u32,
+        offset: u32,
         properties: Option<&[&str]>,
     ) -> Result<EmailPage> {
         let account_id = self.account_id()?;
@@ -921,7 +924,8 @@ impl JmapClient {
                         "accountId": account_id,
                         "filter": jmap_filter,
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit
+                        "limit": limit,
+                        "position": offset
                     },
                     "q0"
                 ]),

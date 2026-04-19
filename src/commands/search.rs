@@ -43,6 +43,7 @@ pub fn split_address_filter(raw: Option<String>) -> Vec<String> {
 pub async fn search(
     filter: SearchFilter,
     limit: u32,
+    offset: u32,
     projection: Projection,
 ) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
@@ -58,10 +59,10 @@ pub async fn search(
     let props_slice = props.as_deref();
 
     let page = client
-        .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, props_slice)
+        .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, offset, props_slice)
         .await?;
     let returned = page.emails.len() as u32;
-    let truncated = page.total > returned;
+    let truncated = page.total > offset.saturating_add(returned);
     Output::success(project_many(page.emails, &projection))
         .with_total(page.total, truncated)
         .print();

@@ -11,13 +11,20 @@ pub async fn list_mailboxes() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_emails(mailbox: &str, limit: u32, projection: Projection) -> anyhow::Result<()> {
+pub async fn list_emails(
+    mailbox: &str,
+    limit: u32,
+    offset: u32,
+    projection: Projection,
+) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
 
     let mailbox = client.find_mailbox(mailbox).await?;
     let props = projection.jmap_properties(false);
     let props_slice = props.as_deref();
-    let page = client.list_emails(&mailbox.id, limit, props_slice).await?;
+    let page = client
+        .list_emails(&mailbox.id, limit, offset, props_slice)
+        .await?;
 
     #[derive(serde::Serialize)]
     struct EmailListResponse {
@@ -26,7 +33,7 @@ pub async fn list_emails(mailbox: &str, limit: u32, projection: Projection) -> a
     }
 
     let returned = page.emails.len() as u32;
-    let truncated = page.total > returned;
+    let truncated = page.total > offset.saturating_add(returned);
 
     Output::success(EmailListResponse {
         mailbox,
