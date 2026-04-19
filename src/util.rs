@@ -360,47 +360,39 @@ pub fn resolve_html(
     Ok(None)
 }
 
-/// Convert HTML to plain text with best-effort formatting.
+/// Convert HTML to plain text for `--compact` body extraction.
 ///
-/// Used as the fallback for `--compact` body extraction when an email has no
-/// `text/plain` part. Not a full HTML parser — handles tags, common entities,
-/// and whitespace collapse. Good enough for agents reading the gist.
+/// Backed by `html2text` (html5ever under the hood). A prior hand-rolled
+/// string-state stripper leaked `<script>`/`<style>` contents and choked on
+/// malformed HTML; a real parser is the only correct option. Kept sync
+/// because `flatten_text_body` / `project_email` are pure data transformation
+/// with no I/O — making them async to reuse kreuzberg's async API would
+/// spread async pointlessly through the projection layer.
+///
+/// `no_table()` is load-bearing: the default `RichDecorator` renders tables
+/// with box-drawing characters, which blow up the output by >10× on
+/// table-heavy marketing emails (observed 111 KB HTML → 330 KB rendered).
+/// Plain decorator + no_table flattens tables to inline content.
+///
+/// Width controls paragraph wrap. Big number minimises artificial line
+/// breaks while keeping pathological inputs bounded.
 pub fn strip_html_to_text(html: &str) -> String {
-    let mut s = html.to_string();
-    for pat in [
-        "</p>", "</P>", "</div>", "</DIV>", "</li>", "</LI>", "</tr>", "</TR>", "</h1>", "</h2>",
-        "</h3>", "</h4>", "</h5>", "</h6>", "</H1>", "</H2>", "</H3>", "</H4>", "</H5>", "</H6>",
-    ] {
-        s = s.replace(pat, "\n");
-    }
-    for pat in ["<br>", "<br/>", "<br />", "<BR>", "<BR/>", "<BR />"] {
-        s = s.replace(pat, "\n");
-    }
+    const WIDTH: usize = 120;
+    let raw = match html2text::config::plain()
+        .no_table_borders()
+        .string_from_read(html.as_bytes(), WIDTH)
+    {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
 
-    let mut stripped = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' if in_tag => in_tag = false,
-            c if !in_tag => stripped.push(c),
-            _ => {}
-        }
-    }
-
-    let decoded = stripped
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'");
-
-    let mut out = String::with_capacity(decoded.len());
+    // html2text pads every line to full WIDTH with trailing spaces and emits
+    // many blank lines between blocks. Trim each line and collapse runs of
+    // blanks so we don't burn tokens on whitespace.
+    let mut out = String::with_capacity(raw.len());
     let mut prev_blank = true;
-    for line in decoded.lines() {
-        let trimmed = line.trim();
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
         if trimmed.is_empty() {
             if !prev_blank {
                 out.push('\n');
@@ -408,18 +400,7 @@ pub fn strip_html_to_text(html: &str) -> String {
             }
             continue;
         }
-        let mut ws_prev = false;
-        for c in trimmed.chars() {
-            if c.is_whitespace() {
-                if !ws_prev {
-                    out.push(' ');
-                }
-                ws_prev = true;
-            } else {
-                out.push(c);
-                ws_prev = false;
-            }
-        }
+        out.push_str(trimmed);
         out.push('\n');
         prev_blank = false;
     }
@@ -430,6 +411,45 @@ pub fn strip_html_to_text(html: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_strip_html_drops_style_block() {
+        let html = r#"<html><head><style>
+            .button { color: red; }
+            div[style*="margin"] { margin: 0 !important; }
+        </style></head><body><p>Hello <b>world</b></p></body></html>"#;
+        let out = strip_html_to_text(html);
+        assert!(
+            !out.contains("color"),
+            "stripped output still contains CSS: {out}"
+        );
+        assert!(
+            !out.contains("margin"),
+            "stripped output still contains CSS: {out}"
+        );
+        assert!(out.to_lowercase().contains("hello"));
+        assert!(out.to_lowercase().contains("world"));
+    }
+
+    #[test]
+    fn test_strip_html_drops_script_block() {
+        let html = r#"<html><body>
+            <script>var secret = "leaked";</script>
+            <p>Visible text</p>
+        </body></html>"#;
+        let out = strip_html_to_text(html);
+        assert!(!out.contains("secret"), "script body leaked: {out}");
+        assert!(!out.contains("leaked"), "script body leaked: {out}");
+        assert!(out.contains("Visible text"));
+    }
+
+    #[test]
+    fn test_strip_html_decodes_entities() {
+        let out = strip_html_to_text("<p>&amp; &lt; &gt; &quot;</p>");
+        assert!(out.contains('&'));
+        assert!(out.contains('<'));
+        assert!(out.contains('>'));
+    }
 
     #[test]
     fn test_resolve_html_inline() {

@@ -256,6 +256,38 @@ mod tests {
     }
 
     #[test]
+    fn compact_strips_html_when_textbody_part_is_text_html() {
+        // JMAP reports the HTML part in `textBody` when no plain-text part
+        // exists. textBody[0].type is "text/html", not "text/plain". We must
+        // strip the HTML before returning it as the compact `textBody` field.
+        let mut email = sample_email();
+        let mut bv = HashMap::new();
+        bv.insert(
+            "1".to_string(),
+            EmailBodyValue {
+                value: "<html><body><p>Hello <b>world</b></p></body></html>".into(),
+                is_encoding_problem: false,
+                is_truncated: false,
+            },
+        );
+        email.body_values = Some(bv);
+        email.text_body = Some(vec![EmailBodyPart {
+            part_id: Some("1".into()),
+            blob_id: None,
+            size: 50,
+            name: None,
+            content_type: Some("text/html".into()),
+            charset: None,
+            disposition: None,
+            cid: None,
+        }]);
+
+        let v = project_email(email, &Projection::Compact);
+        let body = v.get("textBody").and_then(Value::as_str);
+        assert_eq!(body, Some("Hello world"));
+    }
+
+    #[test]
     fn compact_falls_back_to_stripped_html_when_no_text_part() {
         let mut email = sample_email();
         let mut bv = HashMap::new();

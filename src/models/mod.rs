@@ -261,12 +261,31 @@ impl From<Email> for CompactEmail {
     }
 }
 
-/// Extract flattened plain text from an `Email`, falling back to
-/// HTML-stripped content when no `text/plain` part exists.
+/// Extract flattened plain text from an `Email`.
+///
+/// JMAP reports the HTML part in `textBody` when no real `text/plain` part
+/// exists ("best text representation"), so we can't blindly return
+/// `textBody[0]`'s value — if its content type is `text/html`, we strip it.
+/// Falls back to `htmlBody[0]` as a last resort.
 fn flatten_text_body(email: &Email) -> Option<String> {
-    if let Some(text) = email.text_content() {
-        return Some(text.to_string());
+    let body_values = email.body_values.as_ref()?;
+
+    if let Some(parts) = email.text_body.as_ref()
+        && let Some(first) = parts.first()
+        && let Some(part_id) = first.part_id.as_ref()
+        && let Some(body) = body_values.get(part_id)
+    {
+        let is_html = first.content_type.as_deref() == Some("text/html");
+        let out = if is_html {
+            crate::util::strip_html_to_text(&body.value)
+        } else {
+            body.value.clone()
+        };
+        if !out.is_empty() {
+            return Some(out);
+        }
     }
+
     email
         .html_content()
         .map(crate::util::strip_html_to_text)
