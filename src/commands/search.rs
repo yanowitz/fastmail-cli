@@ -57,10 +57,14 @@ pub async fn search(
     let props = projection.jmap_properties(false);
     let props_slice = props.as_deref();
 
-    let emails = client
+    let page = client
         .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, props_slice)
         .await?;
-    Output::success(project_many(emails, &projection)).print();
+    let returned = page.emails.len() as u32;
+    let truncated = page.total > returned;
+    Output::success(project_many(page.emails, &projection))
+        .with_total(page.total, truncated)
+        .print();
 
     Ok(())
 }

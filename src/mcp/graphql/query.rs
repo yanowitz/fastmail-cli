@@ -38,8 +38,8 @@ impl QueryRoot {
         let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
-        let emails = client.list_emails(&mb.id, limit, None).await?;
-        Ok(emails.into_iter().map(Into::into).collect())
+        let page = client.list_emails(&mb.id, limit, None).await?;
+        Ok(page.emails.into_iter().map(Into::into).collect())
     }
 
     /// Get full content of a specific email by ID. Includes nested attachments —
@@ -122,10 +122,10 @@ impl QueryRoot {
             None
         };
 
-        let emails = client
+        let page = client
             .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, None)
             .await?;
-        Ok(emails.into_iter().map(Into::into).collect())
+        Ok(page.emails.into_iter().map(Into::into).collect())
     }
 
     /// List attachment metadata for an email. Select `content` on each attachment to fetch data.

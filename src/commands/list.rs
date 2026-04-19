@@ -17,7 +17,7 @@ pub async fn list_emails(mailbox: &str, limit: u32, projection: Projection) -> a
     let mailbox = client.find_mailbox(mailbox).await?;
     let props = projection.jmap_properties(false);
     let props_slice = props.as_deref();
-    let emails = client.list_emails(&mailbox.id, limit, props_slice).await?;
+    let page = client.list_emails(&mailbox.id, limit, props_slice).await?;
 
     #[derive(serde::Serialize)]
     struct EmailListResponse {
@@ -25,10 +25,14 @@ pub async fn list_emails(mailbox: &str, limit: u32, projection: Projection) -> a
         emails: Vec<serde_json::Value>,
     }
 
+    let returned = page.emails.len() as u32;
+    let truncated = page.total > returned;
+
     Output::success(EmailListResponse {
         mailbox,
-        emails: project_many(emails, &projection),
+        emails: project_many(page.emails, &projection),
     })
+    .with_total(page.total, truncated)
     .print();
 
     Ok(())

@@ -207,6 +207,20 @@ struct GetResponse<T> {
     list: Vec<T>,
 }
 
+/// Minimal view of `Email/query`'s response — we only need `total` to tell
+/// callers whether their result set was clipped. JMAP always populates it.
+#[derive(Deserialize)]
+struct EmailQueryMeta {
+    total: u32,
+}
+
+/// A batch of emails plus the server-reported total match count.
+#[derive(Debug)]
+pub struct EmailPage {
+    pub emails: Vec<Email>,
+    pub total: u32,
+}
+
 #[derive(Deserialize)]
 struct GetResponseWithNotFound<T> {
     list: Vec<T>,
@@ -664,7 +678,7 @@ impl JmapClient {
         mailbox_id: &str,
         limit: u32,
         properties: Option<&[&str]>,
-    ) -> Result<Vec<Email>> {
+    ) -> Result<EmailPage> {
         let account_id = self.account_id()?;
 
         const DEFAULT_PROPS: &[&str] = &[
@@ -711,10 +725,15 @@ impl JmapClient {
             ])
             .await?;
 
+        let query: EmailQueryMeta =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
             Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(resp.list)
+        Ok(EmailPage {
+            emails: resp.list,
+            total: query.total,
+        })
     }
 
     #[instrument(skip(self))]
@@ -874,7 +893,7 @@ impl JmapClient {
         mailbox_id: Option<&str>,
         limit: u32,
         properties: Option<&[&str]>,
-    ) -> Result<Vec<Email>> {
+    ) -> Result<EmailPage> {
         let account_id = self.account_id()?;
         let jmap_filter = build_jmap_filter(filter, mailbox_id);
 
@@ -922,10 +941,15 @@ impl JmapClient {
             ])
             .await?;
 
+        let query: EmailQueryMeta =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
             Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(resp.list)
+        Ok(EmailPage {
+            emails: resp.list,
+            total: query.total,
+        })
     }
 
     #[instrument(skip(self))]

@@ -341,6 +341,15 @@ pub struct Output<T: Serialize> {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// Total matching records reported by JMAP, independent of the limit.
+    /// Only populated by `search` and `list emails`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u32>,
+    /// True iff more records exist than were returned — i.e. the result
+    /// was clipped by `--limit` (or `--offset` + `--limit`). Only populated
+    /// alongside `total`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 impl<T: Serialize> Output<T> {
@@ -350,6 +359,8 @@ impl<T: Serialize> Output<T> {
             data: Some(data),
             error: None,
             message: None,
+            total: None,
+            truncated: None,
         }
     }
 
@@ -359,6 +370,8 @@ impl<T: Serialize> Output<T> {
             data: None,
             error: None,
             message: Some(message.into()),
+            total: None,
+            truncated: None,
         }
     }
 
@@ -368,7 +381,17 @@ impl<T: Serialize> Output<T> {
             data: None,
             error: Some(err.into()),
             message: None,
+            total: None,
+            truncated: None,
         }
+    }
+
+    /// Attach `total` (JMAP-reported total matches) and a derived
+    /// `truncated` flag. Only meaningful on list-returning commands.
+    pub fn with_total(mut self, total: u32, truncated: bool) -> Self {
+        self.total = Some(total);
+        self.truncated = Some(truncated);
+        self
     }
 
     pub fn print(&self) {
