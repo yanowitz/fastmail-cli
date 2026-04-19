@@ -7,6 +7,11 @@ description: Use when the user mentions Fastmail, fastmail-cli, or needs to send
 
 Rust CLI for Fastmail via JMAP (email) and CardDAV (contacts). Output is JSON: `{"success": bool, "data": ..., "error"?, "message"?}`.
 
+**Non-obvious field shapes in email output** (matters for jq):
+- `from`, `to`, `cc`, `bcc`, `replyTo` → `Array<{name: string|null, email: string}>`. Use `.from[0].email`, not `.from`.
+- `keywords`, `mailboxIds` → maps (object with boolean values like `{"$seen": true}`), not arrays.
+- `--compact` derives `unread`/`flagged` bools and drops `mailboxIds`/`keywords`.
+
 ## Setup
 
 ```bash
