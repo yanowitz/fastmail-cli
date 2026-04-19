@@ -547,6 +547,23 @@ impl JmapClient {
         Err(Error::MailboxNotFound(name.into()))
     }
 
+    /// Find the mailbox with the given JMAP `role` (e.g. "sent", "drafts").
+    /// Unlike [`find_mailbox`], this ignores the `name` field entirely — so
+    /// a user-created mailbox that happens to share a name with a canonical
+    /// role does not win over the role-flagged one.
+    ///
+    /// Used from the compose path so forwards / replies / sends land in the
+    /// folder that mail clients (including Fastmail web) treat as canonical.
+    pub async fn find_mailbox_by_role(&mut self, role: &str) -> Result<Mailbox> {
+        let mailboxes = self.list_mailboxes().await?;
+        let role_lower = role.to_lowercase();
+        mailboxes
+            .iter()
+            .find(|m| m.role.as_deref().map(str::to_lowercase) == Some(role_lower.clone()))
+            .cloned()
+            .ok_or_else(|| Error::MailboxNotFound(format!("role={role}")))
+    }
+
     #[instrument(skip(self))]
     pub async fn list_emails(
         &self,
@@ -912,10 +929,14 @@ impl JmapClient {
             self.require_capability("urn:ietf:params:jmap:submission", "Email sending")?;
         }
         let account_id = self.account_id()?.to_string();
+        // Canonical roles for the compose path — we always want the role-
+        // flagged mailbox, never a user-created folder that happens to share
+        // the name ("Sent" vs "Sent Items" is a real collision on some
+        // accounts, with the non-role "Sent" being a legacy import).
         let mailbox = if draft {
-            self.find_mailbox("drafts").await?
+            self.find_mailbox_by_role("drafts").await?
         } else {
-            self.find_mailbox("sent").await?
+            self.find_mailbox_by_role("sent").await?
         };
         let identity = match self.resolve_identity(from).await {
             Ok(id) => Some(id),
@@ -2064,5 +2085,58 @@ mod tests {
         let result = client.upload_blob(b"data".to_vec(), "text/plain").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Rate limited"));
+    }
+
+    fn test_mailbox(id: &str, name: &str, role: Option<&str>) -> Mailbox {
+        Mailbox {
+            id: id.into(),
+            name: name.into(),
+            parent_id: None,
+            role: role.map(String::from),
+            total_emails: 0,
+            unread_emails: 0,
+            total_threads: 0,
+            unread_threads: 0,
+            sort_order: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn find_mailbox_by_role_prefers_role_over_name() {
+        // Reproduce the "Sent" vs "Sent Items" account shape:
+        // a user-created folder literally named "Sent" with no role,
+        // plus the canonical role-flagged "Sent Items".
+        let mut client = JmapClient::new("t".into());
+        client.cached_mailboxes = Some(vec![
+            test_mailbox("P9k", "Sent", None),
+            test_mailbox("PA-", "Sent Items", Some("sent")),
+            test_mailbox("PAF", "Sent Messages", None),
+        ]);
+
+        let picked = client.find_mailbox_by_role("sent").await.unwrap();
+        assert_eq!(picked.id, "PA-");
+        assert_eq!(picked.name, "Sent Items");
+    }
+
+    #[tokio::test]
+    async fn find_mailbox_still_name_first_for_user_lookups() {
+        // Regression guard: user-facing --mailbox/--to lookups must still
+        // honour exact names. Only the compose path uses find_mailbox_by_role.
+        let mut client = JmapClient::new("t".into());
+        client.cached_mailboxes = Some(vec![
+            test_mailbox("A", "Work", None),
+            test_mailbox("B", "Sent Items", Some("sent")),
+        ]);
+
+        let picked = client.find_mailbox("Work").await.unwrap();
+        assert_eq!(picked.id, "A");
+    }
+
+    #[tokio::test]
+    async fn find_mailbox_by_role_errors_when_absent() {
+        let mut client = JmapClient::new("t".into());
+        client.cached_mailboxes = Some(vec![test_mailbox("A", "Inbox", Some("inbox"))]);
+        let err = client.find_mailbox_by_role("sent").await.unwrap_err();
+        assert!(err.to_string().contains("role=sent"));
     }
 }
