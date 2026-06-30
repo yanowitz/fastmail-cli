@@ -16,6 +16,7 @@ CLI for Fastmail's JMAP API. Read, search, send, and manage emails from your ter
 | **MCP Server**        | Claude integration via Model Context Protocol                          |
 | **Shell Completions** | Bash, Zsh, Fish, PowerShell                                            |
 | **JSON Output**       | All commands output JSON for scripting                                 |
+| **Agent-friendly**    | `--compact` / `--fields` on search/list/get/thread trim list output ~1.5–4×, and drop message bodies entirely with `--fields` (100×+ on long HTML threads) |
 
 ## Quick Start
 
@@ -359,23 +360,39 @@ fastmail-cli list emails | jq '.data.emails[].subject'
 fastmail-cli get EMAIL_ID | jq -r '.data.bodyValues | to_entries[0].value.value'
 ```
 
+## Agent Token Economy: `--compact` / `--fields`
+
+Default JMAP responses are verbose (a default-limit `search` is ~57 KB ≈ 14K tokens). For agent use, `search`, `list emails`, `get`, and `thread` accept two mutually-exclusive flags:
+
+- `--compact`: curated agent-friendly shape. Drops `mailboxIds`/`keywords`/always-null fields; adds derived `unread`/`flagged` booleans; on `get`/`thread` flattens body to plain text (HTML stripped as fallback) and summarizes attachments.
+- `--fields id,subject,from,receivedAt`: JMAP-passthrough projection. Unknown property names error. Pushed down to JMAP as the `properties` parameter, so bandwidth also drops.
+
+Measured reduction on a real account:
+
+| command | default | `--compact` | `--fields` |
+|---|---|---|---|
+| `search -l 50` | 57 KB | 37 KB (1.6×) | 14 KB (4.2×) |
+| `thread` (HTML) | 498 KB | 142 KB (3.5×) | <1 KB (body dropped) |
+| `get` (HTML msg) | 119 KB | 29 KB (~4×) | ~0.5 KB (body dropped) |
+
+`--compact` savings are content-dependent (HTML→text flattening); `--fields` drops bodies, so its factor scales with body size.
+
 ## Claude Code Skills
 
-If you're using [Claude Code](https://claude.ai/claude-code), this repo ships skills that teach agents how to use the CLI — no need to explain flags or workflows manually.
+If you're using [Claude Code](https://claude.ai/claude-code), this repo ships a skill that teaches agents how to use the CLI — no need to explain flags or workflows manually.
 
-Copy the skills into your project's `.claude/skills/` directory (or anywhere Claude Code loads skills from), then invoke them:
+Copy the `fastmail` skill directory into your project's (or user-level) `.claude/skills/`:
 
-```
-/fastmail              # full command reference + common patterns
-/fastmail/search       # search filters, date ranges, workflows
-/fastmail/compose      # send, reply, forward, drafts, identities
-/fastmail/conversations # list, get, thread, mark-read, triage
-/fastmail/attachments  # download, raw vs json, text extraction
-/fastmail/masked       # masked email CRUD
-/fastmail/contacts     # CardDAV setup, list/search
+```bash
+cp -r .claude/skills/fastmail ~/.claude/skills/
+# or per-project:
+cp -r .claude/skills/fastmail /path/to/your/project/.claude/skills/
 ```
 
-Skills are in `.claude/skills/` in this repo. Each one includes concrete examples and agent-oriented workflow patterns.
+The skill auto-triggers when Claude sees Fastmail/email-related requests. Structure:
+
+- `fastmail/SKILL.md` — command reference, common workflows, and token-economy guidance; loaded on trigger.
+- `fastmail/references/{search,conversations,compose,attachments,masked,contacts}.md` — on-demand references. Claude reads them when the task calls for more detail than `SKILL.md` provides.
 
 ## MCP Server (Claude Integration)
 

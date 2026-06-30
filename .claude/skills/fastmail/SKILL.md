@@ -1,0 +1,95 @@
+---
+name: fastmail
+description: Use when the user mentions Fastmail, fastmail-cli, or needs to send, search, read, reply, forward, or triage email from the CLI. Also covers Fastmail contacts (CardDAV), masked email addresses, and email attachments.
+---
+
+# fastmail-cli
+
+Rust CLI for Fastmail via JMAP (email) and CardDAV (contacts). Output is JSON: `{"success": bool, "data": ..., "error"?, "message"?}`.
+
+**Non-obvious field shapes in email output** (matters for jq):
+- `from`, `to`, `cc`, `bcc`, `replyTo` → `Array<{name: string|null, email: string}>`. Use `.from[0].email`, not `.from`.
+- `keywords`, `mailboxIds` → maps (object with boolean values like `{"$seen": true}`), not arrays.
+- `--compact` derives `unread`/`flagged` bools and drops `mailboxIds`/`keywords`.
+
+## Setup
+
+```bash
+fastmail-cli auth          # reads the fmu1-… token from stdin (paste, then Ctrl-D)
+```
+
+Pass the token via stdin, not as an argument — a bare `auth fmu1-…` leaks the token to `ps`, shell history, and the process environment.
+
+Email: `FASTMAIL_API_TOKEN` env or `[core].api_token` in `~/.config/fastmail-cli/config.toml`.
+**Contacts need separate CardDAV credentials** — `FASTMAIL_USERNAME` + `FASTMAIL_APP_PASSWORD` env, or `[contacts]` section in the config. App passwords are at Fastmail Settings → Privacy & Security → App Passwords.
+Debug: `RUST_LOG=debug`.
+
+---
+
+## Output projection (`--compact` / `--fields`)
+
+Default JMAP responses are verbose. `search`, `list emails`, `get`, and `thread` accept two mutually-exclusive flags that also push `properties` down to JMAP so bandwidth shrinks:
+
+- **`--compact`** — curated shape. Drops `mailboxIds`/`keywords`/always-null fields; derives `unread`/`flagged` bools; on `get`/`thread` flattens body to plain text (HTML stripped when no text part exists) and summarizes attachments.
+- **`--fields id,from,subject,receivedAt`** — JMAP passthrough. Validated against the JMAP Email property list (camelCase); unknown names error. Use for bulk/triage where a curated shape is still more than needed.
+- **Neither** — full output. Use when you need raw `keywords` or `bodyValues`.
+
+`id` is always included. Size trade-offs (raw KB / shrink factors) are in `references/search.md`.
+
+---
+
+## Commands
+
+```bash
+fastmail-cli list emails [-m MAILBOX] [-l LIMIT] [--compact | --fields CSV]    # default INBOX/50
+fastmail-cli list mailboxes
+fastmail-cli list identities                                                    # aliases for --from
+
+fastmail-cli get EMAIL_ID [--compact | --fields CSV]
+fastmail-cli thread EMAIL_ID [--compact | --fields CSV]
+
+fastmail-cli search [FILTERS] [--compact | --fields CSV] [-l LIMIT] [--offset N]
+
+# send/reply/forward also take: --html-body HTML | --html-file PATH, -a/--attachment FILE (repeatable)
+fastmail-cli send --to ADDR --subject S --body B [--cc] [--bcc] [--from IDENT] [--reply-to MSG_ID] [--draft]
+fastmail-cli reply EMAIL_ID --body B [--all] [--cc] [--bcc] [--from] [--draft]
+fastmail-cli forward EMAIL_ID --to ADDR [--body] [--cc] [--bcc] [--from] [--draft]
+
+fastmail-cli move EMAIL_ID --to MAILBOX
+fastmail-cli mark-read EMAIL_ID [--unread]
+fastmail-cli spam EMAIL_ID [-y]
+
+fastmail-cli download EMAIL_ID [-o DIR] [-f raw|json] [--max-size 1M]
+
+fastmail-cli masked list|create|enable|disable|delete ...
+fastmail-cli contacts list|search QUERY|create|update|delete ...   # create/update/delete write via CardDAV
+```
+
+**Search filters** (all ANDed): `--text/-t`, `--from`, `--to`, `--cc`, `--bcc`, `--subject`, `--body`, `--mailbox/-m`, `--before`, `--after` (ISO 8601), `--unread`, `--flagged`, `--has-attachment`, `--min-size`, `--max-size`.
+
+---
+
+## Piping between commands
+
+`jq` is only needed to feed a value into the next shell command. For inspection, just read the JSON. When piping, pair `--fields id` with `jq -r`:
+
+```bash
+fastmail-cli reply \
+  $(fastmail-cli search --from boss@ --unread --fields id | jq -r '.data[0].id') \
+  --body "On it."
+```
+
+For bulk triage (looping over many ids), see `references/search.md`.
+
+---
+
+## References
+
+Read these when the task needs more than the above:
+
+- [`references/search.md`](references/search.md) — filter combinations, projection trade-offs
+- [`references/conversations.md`](references/conversations.md) — list/get/thread patterns
+- [`references/compose.md`](references/compose.md) — send, reply, forward, drafts, identities
+- [`references/attachments.md`](references/attachments.md) — download and extract
+- [`references/masked.md`](references/masked.md) — masked email CRUD
+- [`references/contacts.md`](references/contacts.md) — CardDAV contacts

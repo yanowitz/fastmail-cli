@@ -360,10 +360,141 @@ pub fn resolve_html(
     Ok(None)
 }
 
+/// Escape the five HTML-significant characters (`& < > " '`) so a string
+/// can be inlined into an HTML document without being reinterpreted as
+/// markup. Used when the caller assembles HTML from trusted text (e.g.
+/// a user's plain-text forward intro + attribution lines).
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Convert a plain-text block into HTML by escaping it and turning
+/// newlines into `<br>`. Keeps the source newline so the generated
+/// HTML stays readable in a diff or inspector.
+pub fn text_to_html(text: &str) -> String {
+    html_escape(text).replace('\n', "<br>\n")
+}
+
+/// Convert HTML to plain text for `--compact` body extraction.
+///
+/// Backed by `html2text` (html5ever under the hood). A prior hand-rolled
+/// string-state stripper leaked `<script>`/`<style>` contents and choked on
+/// malformed HTML; a real parser is the only correct option. Kept sync
+/// because `flatten_text_body` / `project_email` are pure data transformation
+/// with no I/O — making them async to reuse kreuzberg's async API would
+/// spread async pointlessly through the projection layer.
+///
+/// `no_table()` is load-bearing: the default `RichDecorator` renders tables
+/// with box-drawing characters, which blow up the output by >10× on
+/// table-heavy marketing emails (observed 111 KB HTML → 330 KB rendered).
+/// Plain decorator + no_table flattens tables to inline content.
+///
+/// Width controls paragraph wrap. Big number minimises artificial line
+/// breaks while keeping pathological inputs bounded.
+pub fn strip_html_to_text(html: &str) -> String {
+    const WIDTH: usize = 120;
+    let raw = match html2text::config::plain()
+        .no_table_borders()
+        .string_from_read(html.as_bytes(), WIDTH)
+    {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+
+    // html2text pads every line to full WIDTH with trailing spaces and emits
+    // many blank lines between blocks. Trim each line and collapse runs of
+    // blanks so we don't burn tokens on whitespace.
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_blank = true;
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            if !prev_blank {
+                out.push('\n');
+                prev_blank = true;
+            }
+            continue;
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+        prev_blank = false;
+    }
+    out.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn test_strip_html_drops_style_block() {
+        let html = r#"<html><head><style>
+            .button { color: red; }
+            div[style*="margin"] { margin: 0 !important; }
+        </style></head><body><p>Hello <b>world</b></p></body></html>"#;
+        let out = strip_html_to_text(html);
+        assert!(
+            !out.contains("color"),
+            "stripped output still contains CSS: {out}"
+        );
+        assert!(
+            !out.contains("margin"),
+            "stripped output still contains CSS: {out}"
+        );
+        assert!(out.to_lowercase().contains("hello"));
+        assert!(out.to_lowercase().contains("world"));
+    }
+
+    #[test]
+    fn test_strip_html_drops_script_block() {
+        let html = r#"<html><body>
+            <script>var secret = "leaked";</script>
+            <p>Visible text</p>
+        </body></html>"#;
+        let out = strip_html_to_text(html);
+        assert!(!out.contains("secret"), "script body leaked: {out}");
+        assert!(!out.contains("leaked"), "script body leaked: {out}");
+        assert!(out.contains("Visible text"));
+    }
+
+    #[test]
+    fn test_html_escape_covers_five_significant_chars() {
+        assert_eq!(
+            html_escape(r#"a & b < c > d " e ' f"#),
+            "a &amp; b &lt; c &gt; d &quot; e &#39; f"
+        );
+    }
+
+    #[test]
+    fn test_html_escape_noop_on_plain_text() {
+        assert_eq!(html_escape("hello world 123"), "hello world 123");
+    }
+
+    #[test]
+    fn test_text_to_html_escapes_and_preserves_linebreaks() {
+        let out = text_to_html("line1 <one>\nline2 & more");
+        assert_eq!(out, "line1 &lt;one&gt;<br>\nline2 &amp; more");
+    }
+
+    #[test]
+    fn test_strip_html_decodes_entities() {
+        let out = strip_html_to_text("<p>&amp; &lt; &gt; &quot;</p>");
+        assert!(out.contains('&'));
+        assert!(out.contains('<'));
+        assert!(out.contains('>'));
+    }
 
     #[test]
     fn test_resolve_html_inline() {

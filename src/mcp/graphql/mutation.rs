@@ -125,7 +125,7 @@ impl MutationRoot {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
-        let original = client.get_email(&email_id).await?;
+        let original = client.get_email(&email_id, None, true).await?;
         let reply_all = all.unwrap_or(false);
         let extra_cc = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
@@ -259,7 +259,7 @@ impl MutationRoot {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
-        let original = client.get_email(&email_id).await?;
+        let original = client.get_email(&email_id, None, true).await?;
         let to_addrs = parse_addresses(&to);
         let cc_addrs = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
@@ -369,7 +369,7 @@ impl MutationRoot {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         let target = client.find_mailbox(&target_mailbox).await?;
 
         match client.move_email(&email_id, &target.id).await {
@@ -403,7 +403,7 @@ impl MutationRoot {
         let client = client.lock().await;
         let read = read.unwrap_or(true);
 
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         let mut keywords = email.keywords.clone();
         if read {
             keywords.insert("$seen".to_string(), true);
@@ -441,7 +441,7 @@ impl MutationRoot {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let mut client = client.lock().await;
 
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
 
         if matches!(action, SpamAction::Preview) {
             let sender = email
