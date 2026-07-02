@@ -141,67 +141,6 @@ fn apply_body_structure(
     }
 }
 
-/// Build the text and HTML bodies for a forwarded email.
-///
-/// Text body: the caller's intro, a divider, From/Date/Subject attribution,
-/// and the original's text content. When the original has no plain-text
-/// part, the HTML part is rendered to text via [`strip_html_to_text`] so
-/// the forward isn't silently empty.
-///
-/// HTML body: emitted only when the original carried an HTML part and the
-/// caller didn't supply their own `--html-body`. The generated HTML mirrors
-/// the text attribution, with the caller's intro and the attribution lines
-/// HTML-escaped, then the original HTML appended verbatim. When the caller
-/// does supply `--html-body`, that value wins — explicit control over
-/// presentation outranks auto-preservation.
-fn build_forward_bodies(
-    original: &Email,
-    user_text: &str,
-    user_html: Option<&str>,
-) -> (String, Option<String>) {
-    let sender = original
-        .from
-        .as_ref()
-        .and_then(|f| f.first())
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let date = original.received_at.as_deref().unwrap_or("unknown date");
-    let subject = original.subject.as_deref().unwrap_or("");
-
-    let original_text = original
-        .text_content()
-        .map(str::to_string)
-        .or_else(|| original.html_content().map(crate::util::strip_html_to_text))
-        .unwrap_or_default();
-
-    let text_body = format!(
-        "{}\n\n---------- Forwarded message ---------\nFrom: {}\nDate: {}\nSubject: {}\n\n{}",
-        user_text, sender, date, subject, original_text,
-    );
-
-    let html_body = if let Some(html) = user_html {
-        Some(html.to_string())
-    } else {
-        original.html_content().map(|orig_html| {
-            let attribution = format!(
-                "<div>---------- Forwarded message ---------<br>\
-                 <b>From:</b> {}<br><b>Date:</b> {}<br><b>Subject:</b> {}<br><br>",
-                crate::util::html_escape(&sender),
-                crate::util::html_escape(date),
-                crate::util::html_escape(subject),
-            );
-            format!(
-                "{}<br><br>{}{}</div>",
-                crate::util::text_to_html(user_text),
-                attribution,
-                orig_html,
-            )
-        })
-    };
-
-    (text_body, html_body)
-}
-
 /// Resolved context for a compose operation
 struct ComposeContext {
     account_id: String,
@@ -266,20 +205,6 @@ impl ComposeContext {
 #[derive(Deserialize)]
 struct GetResponse<T> {
     list: Vec<T>,
-}
-
-/// Minimal view of `Email/query`'s response — we only need `total` to tell
-/// callers whether their result set was clipped. JMAP always populates it.
-#[derive(Deserialize)]
-struct EmailQueryMeta {
-    total: u32,
-}
-
-/// A batch of emails plus the server-reported total match count.
-#[derive(Debug)]
-pub struct EmailPage {
-    pub emails: Vec<Email>,
-    pub total: u32,
 }
 
 #[derive(Deserialize)]
@@ -428,100 +353,6 @@ pub fn expand_reply_recipients(
 fn dedup_by_email(addrs: &mut Vec<EmailAddress>) {
     let mut seen = std::collections::HashSet::<String>::new();
     addrs.retain(|a| seen.insert(a.email.to_lowercase()));
-}
-
-/// Translate a [`SearchFilter`] and optional mailbox ID into a JMAP
-/// `Email/query` filter tree.
-///
-/// Single-value fields collapse into a flat FilterCondition object
-/// (`{from: "x", subject: "y"}`). Address fields (`from`/`to`/`cc`/`bcc`)
-/// with >1 entries become a JMAP OR FilterOperator on that field. When
-/// both a flat condition and one or more OR operators exist, they combine
-/// under a top-level AND. Empty filter → `{}`.
-///
-/// Preserving the flat shape for single-value-only calls keeps the wire
-/// format byte-identical to pre-multi-value behaviour for existing
-/// consumers.
-fn build_jmap_filter(filter: &SearchFilter, mailbox_id: Option<&str>) -> Value {
-    let mut flat = serde_json::Map::new();
-    let mut or_conditions: Vec<Value> = Vec::new();
-
-    if let Some(t) = &filter.text {
-        flat.insert("text".into(), json!(t));
-    }
-    if let Some(s) = &filter.subject {
-        flat.insert("subject".into(), json!(s));
-    }
-    if let Some(b) = &filter.body {
-        flat.insert("body".into(), json!(b));
-    }
-    if let Some(m) = mailbox_id {
-        flat.insert("inMailbox".into(), json!(m));
-    }
-    if filter.has_attachment {
-        flat.insert("hasAttachment".into(), json!(true));
-    }
-    if let Some(min) = filter.min_size {
-        flat.insert("minSize".into(), json!(min));
-    }
-    if let Some(max) = filter.max_size {
-        flat.insert("maxSize".into(), json!(max));
-    }
-    if let Some(before) = &filter.before {
-        let date = if before.contains('T') {
-            before.clone()
-        } else {
-            format!("{before}T00:00:00Z")
-        };
-        flat.insert("before".into(), json!(date));
-    }
-    if let Some(after) = &filter.after {
-        let date = if after.contains('T') {
-            after.clone()
-        } else {
-            format!("{after}T00:00:00Z")
-        };
-        flat.insert("after".into(), json!(date));
-    }
-    if filter.unread {
-        flat.insert("notKeyword".into(), json!("$seen"));
-    }
-    if filter.flagged {
-        flat.insert("hasKeyword".into(), json!("$flagged"));
-    }
-
-    // Address fields: single-value → flat; multi-value → OR FilterOperator.
-    for (name, values) in [
-        ("from", &filter.from),
-        ("to", &filter.to),
-        ("cc", &filter.cc),
-        ("bcc", &filter.bcc),
-    ] {
-        match values.len() {
-            0 => {}
-            1 => {
-                flat.insert(name.into(), json!(&values[0]));
-            }
-            _ => {
-                let conds: Vec<Value> = values.iter().map(|v| json!({ name: v })).collect();
-                or_conditions.push(json!({ "operator": "OR", "conditions": conds }));
-            }
-        }
-    }
-
-    match (flat.is_empty(), or_conditions.len()) {
-        (true, 0) => json!({}),
-        (false, 0) => Value::Object(flat),
-        (true, 1) => or_conditions.into_iter().next().unwrap(),
-        _ => {
-            let mut all: Vec<Value> = Vec::with_capacity(or_conditions.len() + 1);
-            if !flat.is_empty() {
-                all.push(Value::Object(flat));
-            }
-            all.extend(or_conditions);
-            json!({ "operator": "AND", "conditions": all })
-        }
-    }
 }
 
 impl JmapClient {
@@ -716,48 +547,9 @@ impl JmapClient {
         Err(Error::MailboxNotFound(name.into()))
     }
 
-    /// Find the mailbox with the given JMAP `role` (e.g. "sent", "drafts").
-    /// Unlike [`find_mailbox`], this ignores the `name` field entirely — so
-    /// a user-created mailbox that happens to share a name with a canonical
-    /// role does not win over the role-flagged one.
-    ///
-    /// Used from the compose path so forwards / replies / sends land in the
-    /// folder that mail clients (including Fastmail web) treat as canonical.
-    pub async fn find_mailbox_by_role(&mut self, role: &str) -> Result<Mailbox> {
-        let mailboxes = self.list_mailboxes().await?;
-        let role_lower = role.to_lowercase();
-        mailboxes
-            .iter()
-            .find(|m| m.role.as_deref().map(str::to_lowercase) == Some(role_lower.clone()))
-            .cloned()
-            .ok_or_else(|| Error::MailboxNotFound(format!("role={role}")))
-    }
-
     #[instrument(skip(self))]
-    pub async fn list_emails(
-        &self,
-        mailbox_id: &str,
-        limit: u32,
-        offset: u32,
-        properties: Option<&[&str]>,
-    ) -> Result<EmailPage> {
+    pub async fn list_emails(&self, mailbox_id: &str, limit: u32) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
-
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
 
         let responses = self
             .request(vec![
@@ -767,9 +559,7 @@ impl JmapClient {
                         "accountId": account_id,
                         "filter": { "inMailbox": mailbox_id },
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit,
-                        "position": offset,
-                        "calculateTotal": true
+                        "limit": limit
                     },
                     "q0"
                 ]),
@@ -782,59 +572,26 @@ impl JmapClient {
                             "name": "Email/query",
                             "path": "/ids"
                         },
-                        "properties": props
+                        "properties": [
+                            "id", "threadId", "mailboxIds", "keywords",
+                            "size", "receivedAt", "from", "to", "cc",
+                            "subject", "preview", "hasAttachment"
+                        ]
                     },
                     "g0"
                 ]),
             ])
             .await?;
 
-        let query: EmailQueryMeta =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
             Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(EmailPage {
-            emails: resp.list,
-            total: query.total,
-        })
+        Ok(resp.list)
     }
 
     #[instrument(skip(self))]
-    pub async fn get_email(
-        &self,
-        email_id: &str,
-        properties: Option<&[&str]>,
-        fetch_body_values: bool,
-    ) -> Result<Email> {
+    pub async fn get_email(&self, email_id: &str) -> Result<Email> {
         let account_id = self.account_id()?;
-
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "blobId",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "messageId",
-            "inReplyTo",
-            "references",
-            "from",
-            "to",
-            "cc",
-            "bcc",
-            "replyTo",
-            "subject",
-            "sentAt",
-            "preview",
-            "hasAttachment",
-            "textBody",
-            "htmlBody",
-            "attachments",
-            "bodyValues",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
 
         let responses = self
             .request(vec![json!([
@@ -842,9 +599,15 @@ impl JmapClient {
                 {
                     "accountId": account_id,
                     "ids": [email_id],
-                    "properties": props,
-                    "fetchTextBodyValues": fetch_body_values,
-                    "fetchHTMLBodyValues": fetch_body_values
+                    "properties": [
+                        "id", "blobId", "threadId", "mailboxIds", "keywords",
+                        "size", "receivedAt", "messageId", "inReplyTo", "references",
+                        "from", "to", "cc", "bcc", "replyTo", "subject", "sentAt",
+                        "preview", "hasAttachment", "textBody", "htmlBody", "attachments",
+                        "bodyValues"
+                    ],
+                    "fetchTextBodyValues": true,
+                    "fetchHTMLBodyValues": true
                 },
                 "g0"
             ])])
@@ -865,20 +628,11 @@ impl JmapClient {
 
     /// Get all emails in a thread
     #[instrument(skip(self))]
-    pub async fn get_thread(
-        &self,
-        email_id: &str,
-        properties: Option<&[&str]>,
-        fetch_body_values: bool,
-    ) -> Result<Vec<Email>> {
+    pub async fn get_thread(&self, email_id: &str) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
 
-        // First look up the email just to get its threadId. Always uses a
-        // minimal fetch — we don't care about the first email's properties
-        // at this stage.
-        let email = self
-            .get_email(email_id, Some(&["id", "threadId"]), false)
-            .await?;
+        // First get the email to find its threadId
+        let email = self.get_email(email_id).await?;
         let thread_id = email
             .thread_id
             .ok_or_else(|| Error::Config("Email has no thread ID".into()))?;
@@ -910,34 +664,20 @@ impl JmapClient {
             .next()
             .ok_or_else(|| Error::Config("Thread not found".into()))?;
 
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-            "textBody",
-            "htmlBody",
-            "bodyValues",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
-
+        // Now get all emails in the thread
         let responses = self
             .request(vec![json!([
                 "Email/get",
                 {
                     "accountId": account_id,
                     "ids": thread.email_ids,
-                    "properties": props,
-                    "fetchTextBodyValues": fetch_body_values,
-                    "fetchHTMLBodyValues": fetch_body_values
+                    "properties": [
+                        "id", "threadId", "mailboxIds", "keywords",
+                        "size", "receivedAt", "from", "to", "cc",
+                        "subject", "preview", "hasAttachment", "textBody", "htmlBody", "bodyValues"
+                    ],
+                    "fetchTextBodyValues": true,
+                    "fetchHTMLBodyValues": true
                 },
                 "e0"
             ])])
@@ -956,27 +696,68 @@ impl JmapClient {
         filter: &SearchFilter,
         mailbox_id: Option<&str>,
         limit: u32,
-        offset: u32,
-        properties: Option<&[&str]>,
-    ) -> Result<EmailPage> {
+    ) -> Result<Vec<Email>> {
         let account_id = self.account_id()?;
-        let jmap_filter = build_jmap_filter(filter, mailbox_id);
 
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
+        // Build JMAP filter object
+        let mut jmap_filter = json!({});
+
+        if let Some(ref text) = filter.text {
+            jmap_filter["text"] = json!(text);
+        }
+        if let Some(ref from) = filter.from {
+            jmap_filter["from"] = json!(from);
+        }
+        if let Some(ref to) = filter.to {
+            jmap_filter["to"] = json!(to);
+        }
+        if let Some(ref cc) = filter.cc {
+            jmap_filter["cc"] = json!(cc);
+        }
+        if let Some(ref bcc) = filter.bcc {
+            jmap_filter["bcc"] = json!(bcc);
+        }
+        if let Some(ref subject) = filter.subject {
+            jmap_filter["subject"] = json!(subject);
+        }
+        if let Some(ref body) = filter.body {
+            jmap_filter["body"] = json!(body);
+        }
+        if let Some(mailbox) = mailbox_id {
+            jmap_filter["inMailbox"] = json!(mailbox);
+        }
+        if filter.has_attachment {
+            jmap_filter["hasAttachment"] = json!(true);
+        }
+        if let Some(min_size) = filter.min_size {
+            jmap_filter["minSize"] = json!(min_size);
+        }
+        if let Some(max_size) = filter.max_size {
+            jmap_filter["maxSize"] = json!(max_size);
+        }
+        if let Some(ref before) = filter.before {
+            // Normalize date to ISO 8601 if needed
+            let date = if before.contains('T') {
+                before.clone()
+            } else {
+                format!("{}T00:00:00Z", before)
+            };
+            jmap_filter["before"] = json!(date);
+        }
+        if let Some(ref after) = filter.after {
+            let date = if after.contains('T') {
+                after.clone()
+            } else {
+                format!("{}T00:00:00Z", after)
+            };
+            jmap_filter["after"] = json!(date);
+        }
+        if filter.unread {
+            jmap_filter["notKeyword"] = json!("$seen");
+        }
+        if filter.flagged {
+            jmap_filter["hasKeyword"] = json!("$flagged");
+        }
 
         let responses = self
             .request(vec![
@@ -986,9 +767,7 @@ impl JmapClient {
                         "accountId": account_id,
                         "filter": jmap_filter,
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit,
-                        "position": offset,
-                        "calculateTotal": true
+                        "limit": limit
                     },
                     "q0"
                 ]),
@@ -1001,22 +780,21 @@ impl JmapClient {
                             "name": "Email/query",
                             "path": "/ids"
                         },
-                        "properties": props
+                        "properties": [
+                            "id", "threadId", "mailboxIds", "keywords",
+                            "size", "receivedAt", "from", "to", "cc",
+                            "subject", "preview", "hasAttachment"
+                        ]
                     },
                     "g0"
                 ]),
             ])
             .await?;
 
-        let query: EmailQueryMeta =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
             Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(EmailPage {
-            emails: resp.list,
-            total: query.total,
-        })
+        Ok(resp.list)
     }
 
     #[instrument(skip(self))]
@@ -1055,14 +833,10 @@ impl JmapClient {
             self.require_capability("urn:ietf:params:jmap:submission", "Email sending")?;
         }
         let account_id = self.account_id()?.to_string();
-        // Canonical roles for the compose path — we always want the role-
-        // flagged mailbox, never a user-created folder that happens to share
-        // the name ("Sent" vs "Sent Items" is a real collision on some
-        // accounts, with the non-role "Sent" being a legacy import).
         let mailbox = if draft {
-            self.find_mailbox_by_role("drafts").await?
+            self.find_mailbox("drafts").await?
         } else {
-            self.find_mailbox_by_role("sent").await?
+            self.find_mailbox("sent").await?
         };
         let identity = match self.resolve_identity(from).await {
             Ok(id) => Some(id),
@@ -1437,8 +1211,26 @@ impl JmapClient {
             format!("Fwd: {}", original.subject.as_deref().unwrap_or(""))
         };
 
-        let (full_body, derived_html) =
-            build_forward_bodies(original, body, params.html_body.as_deref());
+        // Build forwarded body with attribution
+        let original_body = original.text_content().unwrap_or("");
+
+        let sender = original
+            .from
+            .as_ref()
+            .and_then(|f| f.first())
+            .map(|a| a.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let date = original.received_at.as_deref().unwrap_or("unknown date");
+
+        let full_body = format!(
+            "{}\n\n---------- Forwarded message ---------\nFrom: {}\nDate: {}\nSubject: {}\n\n{}",
+            body,
+            sender,
+            date,
+            original.subject.as_deref().unwrap_or(""),
+            original_body
+        );
 
         self.create_and_submit_email(
             &ctx,
@@ -1448,7 +1240,7 @@ impl JmapClient {
                 bcc: &params.bcc,
                 subject: &subject,
                 body: &full_body,
-                html_body: derived_html.as_deref(),
+                html_body: params.html_body.as_deref(),
                 attachments: params.attachments,
                 threading: None,
             },
@@ -1914,146 +1706,6 @@ mod tests {
         assert_eq!(emails(&to), vec!["sender@x", "a@x"]);
     }
 
-    fn forward_fixture(text: Option<&str>, html: Option<&str>) -> Email {
-        let mut body_values: HashMap<String, EmailBodyValue> = HashMap::new();
-        let text_body = text.map(|t| {
-            body_values.insert(
-                "text-1".into(),
-                EmailBodyValue {
-                    value: t.into(),
-                    is_encoding_problem: false,
-                    is_truncated: false,
-                },
-            );
-            vec![EmailBodyPart {
-                part_id: Some("text-1".into()),
-                blob_id: None,
-                size: 0,
-                name: None,
-                content_type: Some("text/plain".into()),
-                charset: None,
-                disposition: None,
-                cid: None,
-            }]
-        });
-        let html_body = html.map(|h| {
-            body_values.insert(
-                "html-1".into(),
-                EmailBodyValue {
-                    value: h.into(),
-                    is_encoding_problem: false,
-                    is_truncated: false,
-                },
-            );
-            vec![EmailBodyPart {
-                part_id: Some("html-1".into()),
-                blob_id: None,
-                size: 0,
-                name: None,
-                content_type: Some("text/html".into()),
-                charset: None,
-                disposition: None,
-                cid: None,
-            }]
-        });
-        Email {
-            id: "e1".into(),
-            blob_id: None,
-            thread_id: None,
-            mailbox_ids: HashMap::new(),
-            keywords: HashMap::new(),
-            size: 0,
-            received_at: Some("2026-04-18T12:00:00Z".into()),
-            message_id: None,
-            in_reply_to: None,
-            references: None,
-            from: Some(vec![EmailAddress {
-                name: Some("Ann".into()),
-                email: "ann@x".into(),
-            }]),
-            to: None,
-            cc: None,
-            bcc: None,
-            reply_to: None,
-            subject: Some("Original".into()),
-            sent_at: None,
-            preview: None,
-            has_attachment: false,
-            text_body,
-            html_body,
-            attachments: None,
-            body_values: Some(body_values),
-        }
-    }
-
-    #[test]
-    fn test_build_forward_bodies_text_and_html_original() {
-        let original = forward_fixture(Some("hello world"), Some("<p>hello <b>world</b></p>"));
-        let (text, html) = build_forward_bodies(&original, "fyi", None);
-        assert!(text.contains("fyi\n\n"));
-        assert!(text.contains("From: Ann <ann@x>"));
-        assert!(text.contains("Subject: Original"));
-        assert!(text.ends_with("hello world"));
-
-        let html = html.expect("html body should be emitted when original has html");
-        assert!(html.starts_with("fyi<br><br>"));
-        assert!(html.contains("<b>From:</b> Ann &lt;ann@x&gt;"));
-        assert!(html.contains("<b>Subject:</b> Original"));
-        assert!(html.contains("<p>hello <b>world</b></p>"));
-        assert!(html.ends_with("</div>"));
-    }
-
-    #[test]
-    fn test_build_forward_bodies_html_only_original() {
-        // JMAP emails without a text/plain part: the text forward body must
-        // still include readable content, derived from the HTML.
-        let original = forward_fixture(None, Some("<p>Flight <b>AA123</b> confirmed</p>"));
-        let (text, html) = build_forward_bodies(&original, "", None);
-        assert!(
-            text.contains("Flight"),
-            "text body should carry html-derived content: {text}"
-        );
-        assert!(html.is_some(), "html body should still be emitted");
-    }
-
-    #[test]
-    fn test_build_forward_bodies_text_only_original() {
-        // No HTML part on the original → no HTML part on the forward.
-        // Preserves pre-existing behaviour for plain-text-only forwards.
-        let original = forward_fixture(Some("plain body"), None);
-        let (text, html) = build_forward_bodies(&original, "", None);
-        assert!(text.contains("plain body"));
-        assert!(html.is_none());
-    }
-
-    #[test]
-    fn test_build_forward_bodies_user_html_wins() {
-        // Explicit --html-body takes precedence; we don't append original HTML.
-        let original = forward_fixture(Some("plain"), Some("<p>original</p>"));
-        let (_, html) = build_forward_bodies(&original, "", Some("<p>mine</p>"));
-        assert_eq!(html.as_deref(), Some("<p>mine</p>"));
-    }
-
-    #[test]
-    fn test_build_forward_bodies_escapes_attribution() {
-        // Sender name or subject containing HTML-significant characters must
-        // not be interpreted as markup in the generated HTML attribution.
-        let mut original = forward_fixture(Some("body"), Some("<p>hi</p>"));
-        original.from = Some(vec![EmailAddress {
-            name: Some("<script>".into()),
-            email: "x@y".into(),
-        }]);
-        original.subject = Some("A & B".into());
-        let (_, html) = build_forward_bodies(&original, "", None);
-        let html = html.unwrap();
-        assert!(
-            !html.contains("<script>"),
-            "sender name not escaped: {html}"
-        );
-        assert!(html.contains("&lt;script&gt;"));
-        assert!(html.contains("A &amp; B"));
-    }
-
     #[test]
     fn test_expand_reply_preserves_to_order() {
         let original = reply_fixture(
@@ -2333,126 +1985,5 @@ mod tests {
         let result = client.upload_blob(b"data".to_vec(), "text/plain").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Rate limited"));
-    }
-
-    fn test_mailbox(id: &str, name: &str, role: Option<&str>) -> Mailbox {
-        Mailbox {
-            id: id.into(),
-            name: name.into(),
-            parent_id: None,
-            role: role.map(String::from),
-            total_emails: 0,
-            unread_emails: 0,
-            total_threads: 0,
-            unread_threads: 0,
-            sort_order: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn find_mailbox_by_role_prefers_role_over_name() {
-        // Reproduce the "Sent" vs "Sent Items" account shape:
-        // a user-created folder literally named "Sent" with no role,
-        // plus the canonical role-flagged "Sent Items".
-        let mut client = JmapClient::new("t".into());
-        client.cached_mailboxes = Some(vec![
-            test_mailbox("P9k", "Sent", None),
-            test_mailbox("PA-", "Sent Items", Some("sent")),
-            test_mailbox("PAF", "Sent Messages", None),
-        ]);
-
-        let picked = client.find_mailbox_by_role("sent").await.unwrap();
-        assert_eq!(picked.id, "PA-");
-        assert_eq!(picked.name, "Sent Items");
-    }
-
-    #[tokio::test]
-    async fn find_mailbox_still_name_first_for_user_lookups() {
-        // Regression guard: user-facing --mailbox/--to lookups must still
-        // honour exact names. Only the compose path uses find_mailbox_by_role.
-        let mut client = JmapClient::new("t".into());
-        client.cached_mailboxes = Some(vec![
-            test_mailbox("A", "Work", None),
-            test_mailbox("B", "Sent Items", Some("sent")),
-        ]);
-
-        let picked = client.find_mailbox("Work").await.unwrap();
-        assert_eq!(picked.id, "A");
-    }
-
-    #[tokio::test]
-    async fn find_mailbox_by_role_errors_when_absent() {
-        let mut client = JmapClient::new("t".into());
-        client.cached_mailboxes = Some(vec![test_mailbox("A", "Inbox", Some("inbox"))]);
-        let err = client.find_mailbox_by_role("sent").await.unwrap_err();
-        assert!(err.to_string().contains("role=sent"));
-    }
-
-    fn filter_with_from(values: Vec<&str>) -> SearchFilter {
-        SearchFilter {
-            from: values.into_iter().map(String::from).collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn build_filter_single_value_flat_shape() {
-        // Single-value inputs must produce the flat FilterCondition shape
-        // used before multi-value support — backwards compat on the wire.
-        let f = SearchFilter {
-            from: vec!["a@x.com".into()],
-            subject: Some("invoice".into()),
-            ..Default::default()
-        };
-        let v = build_jmap_filter(&f, None);
-        assert_eq!(v["from"], "a@x.com");
-        assert_eq!(v["subject"], "invoice");
-        assert!(v.get("operator").is_none());
-    }
-
-    #[test]
-    fn build_filter_multi_from_becomes_or_operator() {
-        let f = filter_with_from(vec!["a@x.com", "b@y.com"]);
-        let v = build_jmap_filter(&f, None);
-        assert_eq!(v["operator"], "OR");
-        let conds = v["conditions"].as_array().unwrap();
-        assert_eq!(conds.len(), 2);
-        assert_eq!(conds[0]["from"], "a@x.com");
-        assert_eq!(conds[1]["from"], "b@y.com");
-    }
-
-    #[test]
-    fn build_filter_multi_from_and_flat_fields_wrap_in_and() {
-        let f = SearchFilter {
-            from: vec!["a@x.com".into(), "b@y.com".into()],
-            subject: Some("flight".into()),
-            ..Default::default()
-        };
-        let v = build_jmap_filter(&f, None);
-        assert_eq!(v["operator"], "AND");
-        let conds = v["conditions"].as_array().unwrap();
-        assert_eq!(conds.len(), 2);
-        assert_eq!(conds[0]["subject"], "flight");
-        assert_eq!(conds[1]["operator"], "OR");
-    }
-
-    #[test]
-    fn build_filter_two_multi_fields_both_wrapped_in_and() {
-        let f = SearchFilter {
-            from: vec!["a@x".into(), "b@y".into()],
-            to: vec!["c@z".into(), "d@w".into()],
-            ..Default::default()
-        };
-        let v = build_jmap_filter(&f, None);
-        assert_eq!(v["operator"], "AND");
-        let conds = v["conditions"].as_array().unwrap();
-        assert_eq!(conds.len(), 2);
-        assert!(conds.iter().all(|c| c["operator"] == "OR"));
-    }
-
-    #[test]
-    fn build_filter_empty_filter_is_empty_object() {
-        let v = build_jmap_filter(&SearchFilter::default(), None);
-        assert_eq!(v, json!({}));
     }
 }

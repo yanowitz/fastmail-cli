@@ -10,7 +10,7 @@ pub async fn reply(
     let mut client = authenticated_client().await?;
     let draft = params.draft;
 
-    let original = client.get_email(email_id, None, true).await?;
+    let original = client.get_email(email_id).await?;
 
     // Expand reply-all and filter the sending identity on the caller side,
     // so this code path and the MCP preview path use the exact same helper.

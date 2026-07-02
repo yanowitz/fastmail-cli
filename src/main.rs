@@ -5,25 +5,13 @@ mod error;
 mod jmap;
 mod mcp;
 mod models;
-mod projection;
 pub mod util;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use models::Output;
-use projection::Projection;
 use std::io;
 use tracing_subscriber::EnvFilter;
-
-/// Resolve the two projection flags into a [`Projection`].
-/// Clap enforces mutual exclusion; this only does CSV parsing + validation.
-fn resolve_projection(compact: bool, fields: Option<&str>) -> anyhow::Result<Projection> {
-    match (compact, fields) {
-        (true, _) => Ok(Projection::Compact),
-        (false, Some(csv)) => Projection::from_fields_csv(csv).map_err(|e| anyhow::anyhow!(e)),
-        (false, None) => Ok(Projection::Full),
-    }
-}
 
 /// Build ComposeParams with resolved HTML and loaded attachments.
 fn build_compose_params<'a>(
@@ -75,33 +63,12 @@ enum Commands {
     Get {
         /// Email ID
         email_id: String,
-
-        /// Agent-friendly compact output: flattened plain-text body,
-        /// summarized attachments, derived `unread`/`flagged` bools, JMAP
-        /// internals dropped.
-        #[arg(long, conflicts_with = "fields")]
-        compact: bool,
-
-        /// Comma-separated JMAP property names to include (e.g.
-        /// `id,subject,from`). Passed to JMAP as `properties`, so saves
-        /// bandwidth in addition to output bytes.
-        #[arg(long, conflicts_with = "compact")]
-        fields: Option<String>,
     },
 
     /// Get all emails in a thread/conversation
     Thread {
         /// Email ID (will fetch entire thread this email belongs to)
         email_id: String,
-
-        /// Agent-friendly compact output (see `get --compact`). Highest
-        /// leverage on threads — long HTML threads shrink ~1.5–6× (content-dependent).
-        #[arg(long, conflicts_with = "fields")]
-        compact: bool,
-
-        /// Comma-separated JMAP property names (see `get --fields`).
-        #[arg(long, conflicts_with = "compact")]
-        fields: Option<String>,
     },
 
     /// Search emails with JMAP filters
@@ -169,26 +136,6 @@ enum Commands {
         /// Maximum results
         #[arg(short, long, default_value = "50")]
         limit: u32,
-
-        /// Skip this many matches before returning results. Combine with
-        /// `--limit` to page through large result sets. Note: JMAP
-        /// offsets are position-based, so results can shift if the
-        /// mailbox changes between calls.
-        #[arg(long, default_value = "0")]
-        offset: u32,
-
-        /// Agent-friendly compact output: drops JMAP internals
-        /// (`mailboxIds`, `keywords`) and always-null body fields; adds
-        /// derived `unread`/`flagged` bools. ~1.5× on lists; larger on HTML message bodies.
-        #[arg(long, conflicts_with = "fields")]
-        compact: bool,
-
-        /// Comma-separated JMAP property names to return (e.g.
-        /// `id,from,subject,receivedAt`). Passed down to JMAP `properties`
-        /// to cut bandwidth. For bulk triage where preview isn't needed,
-        /// drops bodies — far smaller than --compact on body-heavy get/thread.
-        #[arg(long, conflicts_with = "compact")]
-        fields: Option<String>,
     },
 
     /// Send an email
@@ -446,19 +393,6 @@ enum ListCommands {
         /// Maximum results
         #[arg(short, long, default_value = "50")]
         limit: u32,
-
-        /// Skip this many emails before returning results. Pair with
-        /// `--limit` to page.
-        #[arg(long, default_value = "0")]
-        offset: u32,
-
-        /// Agent-friendly compact output (see `search --compact`).
-        #[arg(long, conflicts_with = "fields")]
-        compact: bool,
-
-        /// Comma-separated JMAP property names (see `search --fields`).
-        #[arg(long, conflicts_with = "compact")]
-        fields: Option<String>,
     },
 
     /// List sender identities (for use with --from)
@@ -567,36 +501,13 @@ async fn main() {
 
         Commands::List(cmd) => match cmd {
             ListCommands::Mailboxes => commands::list_mailboxes().await,
-            ListCommands::Emails {
-                mailbox,
-                limit,
-                offset,
-                compact,
-                fields,
-            } => match resolve_projection(compact, fields.as_deref()) {
-                Ok(proj) => commands::list_emails(&mailbox, limit, offset, proj).await,
-                Err(e) => Err(e),
-            },
+            ListCommands::Emails { mailbox, limit } => commands::list_emails(&mailbox, limit).await,
             ListCommands::Identities => commands::list_identities().await,
         },
 
-        Commands::Get {
-            email_id,
-            compact,
-            fields,
-        } => match resolve_projection(compact, fields.as_deref()) {
-            Ok(proj) => commands::get_email(&email_id, proj).await,
-            Err(e) => Err(e),
-        },
+        Commands::Get { email_id } => commands::get_email(&email_id).await,
 
-        Commands::Thread {
-            email_id,
-            compact,
-            fields,
-        } => match resolve_projection(compact, fields.as_deref()) {
-            Ok(proj) => commands::get_thread(&email_id, proj).await,
-            Err(e) => Err(e),
-        },
+        Commands::Thread { email_id } => commands::get_thread(&email_id).await,
 
         Commands::Search {
             text,
@@ -615,37 +526,29 @@ async fn main() {
             unread,
             flagged,
             limit,
-            offset,
-            compact,
-            fields,
-        } => match resolve_projection(compact, fields.as_deref()) {
-            Ok(proj) => {
-                commands::search(
-                    commands::SearchFilter {
-                        text,
-                        from: commands::split_address_filter(from),
-                        to: commands::split_address_filter(to),
-                        cc: commands::split_address_filter(cc),
-                        bcc: commands::split_address_filter(bcc),
-                        subject,
-                        body,
-                        mailbox,
-                        has_attachment,
-                        min_size,
-                        max_size,
-                        before,
-                        after,
-                        unread,
-                        flagged,
-                    },
-                    limit,
-                    offset,
-                    proj,
-                )
-                .await
-            }
-            Err(e) => Err(e),
-        },
+        } => {
+            commands::search(
+                commands::SearchFilter {
+                    text,
+                    from,
+                    to,
+                    cc,
+                    bcc,
+                    subject,
+                    body,
+                    mailbox,
+                    has_attachment,
+                    min_size,
+                    max_size,
+                    before,
+                    after,
+                    unread,
+                    flagged,
+                },
+                limit,
+            )
+            .await
+        }
 
         Commands::Send {
             to,

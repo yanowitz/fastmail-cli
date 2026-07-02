@@ -1,11 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### Changed
-
-- Dependency updates via `cargo update` (Cargo.lock only).
-
 ## [2.2.2] - 2026-04-18
 
 ### Changed

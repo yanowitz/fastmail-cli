@@ -1,6 +1,5 @@
 use crate::jmap::authenticated_client;
-use crate::models::{Mailbox, Output};
-use crate::projection::{Projection, project_many};
+use crate::models::{Email, Mailbox, Output};
 
 pub async fn list_mailboxes() -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
@@ -11,36 +10,19 @@ pub async fn list_mailboxes() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn list_emails(
-    mailbox: &str,
-    limit: u32,
-    offset: u32,
-    projection: Projection,
-) -> anyhow::Result<()> {
+pub async fn list_emails(mailbox: &str, limit: u32) -> anyhow::Result<()> {
     let mut client = authenticated_client().await?;
 
     let mailbox = client.find_mailbox(mailbox).await?;
-    let props = projection.jmap_properties(false);
-    let props_slice = props.as_deref();
-    let page = client
-        .list_emails(&mailbox.id, limit, offset, props_slice)
-        .await?;
+    let emails = client.list_emails(&mailbox.id, limit).await?;
 
     #[derive(serde::Serialize)]
     struct EmailListResponse {
         mailbox: Mailbox,
-        emails: Vec<serde_json::Value>,
+        emails: Vec<Email>,
     }
 
-    let returned = page.emails.len() as u32;
-    let truncated = page.total > offset.saturating_add(returned);
-
-    Output::success(EmailListResponse {
-        mailbox,
-        emails: project_many(page.emails, &projection),
-    })
-    .with_total(page.total, truncated)
-    .print();
+    Output::success(EmailListResponse { mailbox, emails }).print();
 
     Ok(())
 }

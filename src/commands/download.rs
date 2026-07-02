@@ -16,7 +16,7 @@ pub async fn download_attachment(
     let max_bytes = max_size.and_then(parse_size);
     let client = authenticated_client().await?;
 
-    let email = client.get_email(email_id, None, true).await?;
+    let email = client.get_email(email_id).await?;
 
     let attachments = email.attachments.as_ref();
     if attachments.is_none() || attachments.unwrap().is_empty() {
