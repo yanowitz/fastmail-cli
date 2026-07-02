@@ -38,8 +38,8 @@ impl QueryRoot {
         let mut client = client.lock().await;
         let limit = limit.unwrap_or(25).min(100);
         let mb = client.find_mailbox(&mailbox).await?;
-        let emails = client.list_emails(&mb.id, limit).await?;
-        Ok(emails.into_iter().map(Into::into).collect())
+        let page = client.list_emails(&mb.id, limit, 0, None).await?;
+        Ok(page.emails.into_iter().map(Into::into).collect())
     }
 
     /// Get full content of a specific email by ID. Includes nested attachments —
@@ -51,7 +51,7 @@ impl QueryRoot {
     ) -> Result<Option<GqlEmail>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        match client.get_email(&id).await {
+        match client.get_email(&id, None, true).await {
             Ok(email) => Ok(Some(GqlEmail(email))),
             Err(crate::error::Error::EmailNotFound(_)) => Ok(None),
             Err(e) => Err(e.into()),
@@ -67,7 +67,7 @@ impl QueryRoot {
     ) -> Result<GqlThread> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let mut emails = client.get_thread(&email_id).await?;
+        let mut emails = client.get_thread(&email_id, None, true).await?;
         emails.sort_by(|a, b| a.received_at.cmp(&b.received_at));
         let total = emails.len();
         Ok(GqlThread { emails, total })
@@ -100,10 +100,10 @@ impl QueryRoot {
 
         let filter = crate::commands::SearchFilter {
             text: query,
-            from,
-            to,
-            cc,
-            bcc: None,
+            from: from.into_iter().collect(),
+            to: to.into_iter().collect(),
+            cc: cc.into_iter().collect(),
+            bcc: Vec::new(),
             subject,
             body,
             mailbox: None,
@@ -122,10 +122,10 @@ impl QueryRoot {
             None
         };
 
-        let emails = client
-            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit)
+        let page = client
+            .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, 0, None)
             .await?;
-        Ok(emails.into_iter().map(Into::into).collect())
+        Ok(page.emails.into_iter().map(Into::into).collect())
     }
 
     /// List attachment metadata for an email. Select `content` on each attachment to fetch data.
@@ -136,7 +136,7 @@ impl QueryRoot {
     ) -> Result<Vec<GqlAttachment>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         Ok(GqlEmail(email).make_attachments())
     }
 
@@ -149,7 +149,7 @@ impl QueryRoot {
     ) -> Result<Option<GqlAttachment>> {
         let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
         let client = client.lock().await;
-        let email = client.get_email(&email_id).await?;
+        let email = client.get_email(&email_id, None, true).await?;
         Ok(GqlEmail(email)
             .make_attachments()
             .into_iter()

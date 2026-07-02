@@ -4,7 +4,9 @@ use crate::models::Output;
 pub async fn mark_read(email_id: &str, read: bool) -> anyhow::Result<()> {
     let client = authenticated_client().await?;
 
-    let email = client.get_email(email_id).await?;
+    let email = client
+        .get_email(email_id, Some(&["id", "keywords"]), false)
+        .await?;
 
     let mut keywords = email.keywords.clone();
     if read {
