@@ -32,15 +32,16 @@ pub async fn list_emails(
         emails: Vec<serde_json::Value>,
     }
 
-    let returned = page.emails.len() as u32;
-    let truncated = page.total > offset.saturating_add(returned);
+    let returned = page.emails.len() as u64;
 
-    Output::success(EmailListResponse {
+    let mut output = Output::success(EmailListResponse {
         mailbox,
         emails: project_many(page.emails, &projection),
-    })
-    .with_total(page.total, truncated)
-    .print();
+    });
+    if let Some(total) = page.total {
+        output = output.with_total(total, total > u64::from(offset) + returned);
+    }
+    output.print();
 
     Ok(())
 }

@@ -10,8 +10,8 @@ use serde_json::{Map, Value};
 
 /// Every JMAP Email property the CLI accepts in `--fields`.
 ///
-/// The spec defines a few more (e.g. `sender`, `headers`, `bodyStructure`) that
-/// we don't currently surface. Extend here when new fields are needed.
+/// Includes the ordered raw `headers` list. The spec defines a few more
+/// (e.g. `sender`, `bodyStructure`) not yet accepted by this projection.
 pub const EMAIL_PROPERTIES: &[&str] = &[
     "id",
     "blobId",
@@ -36,6 +36,7 @@ pub const EMAIL_PROPERTIES: &[&str] = &[
     "htmlBody",
     "attachments",
     "bodyValues",
+    "headers",
 ];
 
 /// Fields fetched for `--compact` on `search` / `list emails` (no bodies).
@@ -209,7 +210,26 @@ mod tests {
             html_body: None,
             attachments: None,
             body_values: None,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn headers_projection_preserves_raw_order_and_duplicate_names() {
+        let projection = Projection::from_fields_csv("id,headers").unwrap();
+        assert_eq!(projection.jmap_properties(true).unwrap(), ["id", "headers"]);
+        assert!(!projection.wants_body_values());
+        let headers = serde_json::json!([
+            { "name": "Received", "value": "from second\r\n by mx" },
+            { "name": "Received", "value": "from first" },
+            { "name": "DKIM-Signature", "value": "v=1; b=signature" }
+        ]);
+        let email =
+            serde_json::from_value(serde_json::json!({ "id": "e1", "headers": headers })).unwrap();
+        assert_eq!(
+            project_email(email, &projection),
+            serde_json::json!({ "id": "e1", "headers": headers })
+        );
     }
 
     #[test]

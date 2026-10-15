@@ -1,3 +1,6 @@
+mod events;
+mod watch;
+
 use crate::commands::SearchFilter;
 use crate::error::{Error, Result};
 use crate::models::*;
@@ -8,8 +11,64 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, instrument};
 
+pub use events::{EventParser, ServerEvent};
+pub use watch::{ArrivalWatcher, Arrivals, SharedJmapClient};
+
 const SESSION_URL: &str = "https://api.fastmail.com/jmap/session";
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Properties fetched for list/search results: everything that is cheap to
+/// serialise. Bodies and attachment metadata are deliberately excluded — those
+/// are pulled on demand, in one batched call, by [`JmapClient::get_emails`].
+pub const EMAIL_SUMMARY_PROPERTIES: &[&str] = &[
+    "id",
+    "blobId",
+    "threadId",
+    "mailboxIds",
+    "keywords",
+    "size",
+    "receivedAt",
+    "sentAt",
+    "sender",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "replyTo",
+    "subject",
+    "preview",
+    "hasAttachment",
+];
+
+/// The summary set plus bodies, attachment metadata and threading headers —
+/// the expensive fetch.
+pub const EMAIL_FULL_PROPERTIES: &[&str] = &[
+    "id",
+    "blobId",
+    "threadId",
+    "mailboxIds",
+    "keywords",
+    "size",
+    "receivedAt",
+    "sentAt",
+    "messageId",
+    "inReplyTo",
+    "references",
+    "sender",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "replyTo",
+    "subject",
+    "preview",
+    "hasAttachment",
+    "textBody",
+    "htmlBody",
+    "attachments",
+    "bodyValues",
+    "headers",
+];
 
 const DESIRED_CAPABILITIES: &[&str] = &[
     "urn:ietf:params:jmap:core",
@@ -21,6 +80,7 @@ const DESIRED_CAPABILITIES: &[&str] = &[
 pub struct JmapClient {
     client: Client,
     token: String,
+    session_url: String,
     session: Option<Session>,
     available_capabilities: Vec<String>,
     cached_mailboxes: Option<Vec<Mailbox>>,
@@ -35,11 +95,19 @@ pub async fn authenticated_client() -> crate::error::Result<JmapClient> {
     Ok(client)
 }
 
-/// File attachment data ready for upload
+/// An attachment for an outgoing email.
 pub struct AttachmentData {
     pub filename: String,
     pub content_type: String,
-    pub data: Vec<u8>,
+    pub content: AttachmentContent,
+}
+
+/// Where an attachment's bytes come from.
+pub enum AttachmentContent {
+    /// Bytes still to be uploaded.
+    Bytes(Vec<u8>),
+    /// A blob already on the server, referenced without re-uploading.
+    Blob(String),
 }
 
 /// Common parameters for compose operations (send, reply, forward)
@@ -52,10 +120,43 @@ pub struct ComposeParams<'a> {
     pub attachments: Vec<AttachmentData>,
 }
 
+/// Changes to apply to a draft. `None` keeps the draft's current value; an
+/// empty address list clears that header.
+#[derive(Default)]
+pub struct DraftEdit {
+    pub to: Option<Vec<EmailAddress>>,
+    pub cc: Option<Vec<EmailAddress>>,
+    pub bcc: Option<Vec<EmailAddress>>,
+    /// Identity email to send as.
+    pub from: Option<String>,
+    pub subject: Option<String>,
+    pub body: Option<String>,
+    pub html_body: Option<String>,
+    /// Replaces the draft's attachments. Inline parts an HTML body refers to
+    /// are kept either way.
+    pub attachments: Option<Vec<AttachmentData>>,
+}
+
 /// Threading headers for reply/forward
 struct ThreadingHeaders {
     in_reply_to: Vec<String>,
     references: Vec<String>,
+}
+
+fn reply_threading(in_reply_to: &str, parent_refs: Option<&[String]>) -> ThreadingHeaders {
+    let id = in_reply_to.trim();
+    let id = id
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(id);
+    let mut references = parent_refs.unwrap_or_default().to_vec();
+    references.push(id.to_string());
+    let mut seen = std::collections::HashSet::new();
+    references.retain(|id| seen.insert(id.clone()));
+    ThreadingHeaders {
+        in_reply_to: vec![id.to_string()],
+        references,
+    }
 }
 
 /// Bundled content for the create_and_submit_email helper
@@ -76,6 +177,8 @@ struct UploadedAttachment {
     blob_id: String,
     filename: String,
     content_type: String,
+    /// Content-ID of an inline part, which an HTML body references as `cid:`.
+    inline_cid: Option<String>,
 }
 
 /// Build bodyValues and body structure fields on `email_create`.
@@ -112,12 +215,17 @@ fn apply_body_structure(
 
         let mut sub_parts = vec![content_part];
         for att in attachments {
-            sub_parts.push(json!({
+            let mut part = json!({
                 "blobId": att.blob_id,
                 "name": att.filename,
                 "type": att.content_type,
                 "disposition": "attachment"
-            }));
+            });
+            if let Some(ref cid) = att.inline_cid {
+                part["disposition"] = json!("inline");
+                part["cid"] = json!(cid);
+            }
+            sub_parts.push(part);
         }
 
         email_create.insert(
@@ -145,7 +253,7 @@ fn apply_body_structure(
 ///
 /// Text body: the caller's intro, a divider, From/Date/Subject attribution,
 /// and the original's text content. When the original has no plain-text
-/// part, the HTML part is rendered to text via [`strip_html_to_text`] so
+/// part, the HTML part is rendered to text via [`crate::util::strip_html_to_text`] so
 /// the forward isn't silently empty.
 ///
 /// HTML body: emitted only when the original carried an HTML part and the
@@ -170,8 +278,11 @@ fn build_forward_bodies(
 
     let original_text = original
         .text_content()
-        .map(str::to_string)
-        .or_else(|| original.html_content().map(crate::util::strip_html_to_text))
+        .or_else(|| {
+            original
+                .html_content()
+                .map(|html| crate::util::strip_html_to_text(&html))
+        })
         .unwrap_or_default();
 
     let text_body = format!(
@@ -262,31 +373,199 @@ impl ComposeContext {
     }
 }
 
+/// How many changes to ask for per `Email/changes` call. The server may cap it
+/// lower; `hasMoreChanges` then drives the next page.
+const CHANGES_PAGE: u32 = 100;
+
+/// What arrived since a known `Email` state.
+#[derive(Debug)]
+pub struct EmailChanges {
+    /// The state to pass as `sinceState` next time.
+    pub new_state: String,
+    /// IDs created in that window, oldest change first.
+    pub created: Vec<String>,
+}
+
 // Shared JMAP response types used across multiple methods
 #[derive(Deserialize)]
 struct GetResponse<T> {
     list: Vec<T>,
 }
 
-/// Minimal view of `Email/query`'s response — we only need `total` to tell
-/// callers whether their result set was clipped. JMAP always populates it.
 #[derive(Deserialize)]
-struct EmailQueryMeta {
-    total: u32,
+struct QueryResponse {
+    ids: Vec<String>,
+    #[serde(default)]
+    position: u64,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default, rename = "queryState")]
+    query_state: Option<String>,
 }
 
-/// A batch of emails plus the server-reported total match count.
-#[derive(Debug)]
+/// Where a query window starts.
+///
+/// JMAP offers two ways to say this, and the anchor form is what makes stable
+/// pagination possible: an index shifts whenever mail arrives, but an anchor is
+/// an ID in the result set, so a cursor built from one still points at the same
+/// message a minute later.
+pub enum QueryStart {
+    /// Zero-based index. Negative counts back from the end, so `-10` is "the
+    /// last ten" without needing to know the total first.
+    Position(i64),
+    /// Start relative to a known ID: offset `1` is the item after it, `-n` the
+    /// `n` items ending just before it.
+    Anchor { id: String, offset: i64 },
+}
+
+impl Default for QueryStart {
+    fn default() -> Self {
+        Self::Position(0)
+    }
+}
+
+/// Parameters for one `Email/query` window.
+pub struct EmailQuery {
+    /// A JMAP `FilterCondition` or `FilterOperator` object.
+    pub filter: Value,
+    /// JMAP sort comparators, most significant first.
+    pub sort: Vec<Value>,
+    /// Where the window begins.
+    pub start: QueryStart,
+    pub limit: u32,
+    /// Ask the server for the total match count. Costs the server extra work,
+    /// so only set it when the caller actually needs the number.
+    pub calculate_total: bool,
+    /// Return one email per conversation instead of every message.
+    pub collapse_threads: bool,
+    /// Also fetch summary records for the matched IDs, in query order.
+    pub fetch_summaries: bool,
+    /// Override the properties fetched for matched emails.
+    pub properties: Option<Vec<String>>,
+}
+
+impl EmailQuery {
+    /// Newest-first page of `limit` emails, with summaries and no total.
+    pub fn first(limit: u32) -> Self {
+        Self {
+            filter: json!({}),
+            sort: vec![json!({ "property": "receivedAt", "isAscending": false })],
+            start: QueryStart::Position(0),
+            limit,
+            calculate_total: false,
+            collapse_threads: false,
+            fetch_summaries: true,
+            properties: None,
+        }
+    }
+}
+
+/// Normalise a date to ISO 8601, accepting a bare `YYYY-MM-DD`.
+pub fn normalize_date(date: &str) -> String {
+    if date.contains('T') {
+        date.to_string()
+    } else {
+        format!("{date}T00:00:00Z")
+    }
+}
+
+/// Translate a [`SearchFilter`] and optional mailbox ID into a JMAP
+/// `Email/query` filter tree.
+///
+/// Single-value fields collapse into a flat FilterCondition object
+/// (`{from: "x", subject: "y"}`). Address fields (`from`/`to`/`cc`/`bcc`)
+/// with >1 entries become a JMAP OR FilterOperator on that field. When
+/// both a flat condition and one or more OR operators exist, they combine
+/// under a top-level AND. Empty filter → `{}`.
+///
+/// Preserving the flat shape for single-value-only calls keeps the wire
+/// format byte-identical to pre-multi-value behaviour for existing
+/// consumers.
+pub fn search_filter_to_jmap(filter: &SearchFilter, mailbox_id: Option<&str>) -> Value {
+    let mut flat = serde_json::Map::new();
+    let mut or_conditions: Vec<Value> = Vec::new();
+
+    if let Some(t) = &filter.text {
+        flat.insert("text".into(), json!(t));
+    }
+    if let Some(s) = &filter.subject {
+        flat.insert("subject".into(), json!(s));
+    }
+    if let Some(b) = &filter.body {
+        flat.insert("body".into(), json!(b));
+    }
+    if let Some(m) = mailbox_id {
+        flat.insert("inMailbox".into(), json!(m));
+    }
+    if filter.has_attachment {
+        flat.insert("hasAttachment".into(), json!(true));
+    }
+    if let Some(min) = filter.min_size {
+        flat.insert("minSize".into(), json!(min));
+    }
+    if let Some(max) = filter.max_size {
+        flat.insert("maxSize".into(), json!(max));
+    }
+    if let Some(before) = &filter.before {
+        flat.insert("before".into(), json!(normalize_date(before)));
+    }
+    if let Some(after) = &filter.after {
+        flat.insert("after".into(), json!(normalize_date(after)));
+    }
+    if filter.unread {
+        flat.insert("notKeyword".into(), json!("$seen"));
+    }
+    if filter.flagged {
+        flat.insert("hasKeyword".into(), json!("$flagged"));
+    }
+
+    // Address fields: single-value → flat; multi-value → OR FilterOperator.
+    for (name, values) in [
+        ("from", &filter.from),
+        ("to", &filter.to),
+        ("cc", &filter.cc),
+        ("bcc", &filter.bcc),
+    ] {
+        match values.len() {
+            0 => {}
+            1 => {
+                flat.insert(name.into(), json!(&values[0]));
+            }
+            _ => {
+                let conds: Vec<Value> = values.iter().map(|v| json!({ name: v })).collect();
+                or_conditions.push(json!({ "operator": "OR", "conditions": conds }));
+            }
+        }
+    }
+
+    match (flat.is_empty(), or_conditions.len()) {
+        (true, 0) => json!({}),
+        (false, 0) => Value::Object(flat),
+        (true, 1) => or_conditions.into_iter().next().unwrap(),
+        _ => {
+            let mut all: Vec<Value> = Vec::with_capacity(or_conditions.len() + 1);
+            if !flat.is_empty() {
+                all.push(Value::Object(flat));
+            }
+            all.extend(or_conditions);
+            json!({ "operator": "AND", "conditions": all })
+        }
+    }
+}
+
+/// One window of an `Email/query` result set.
 pub struct EmailPage {
+    /// Summary records in query order. Empty when summaries weren't requested.
     pub emails: Vec<Email>,
-    pub total: u32,
-}
-
-#[derive(Deserialize)]
-struct GetResponseWithNotFound<T> {
-    list: Vec<T>,
-    #[serde(rename = "notFound")]
-    not_found: Vec<String>,
+    /// The IDs this window matched, in order.
+    pub ids: Vec<String>,
+    /// Index of the first returned ID within the full result set.
+    pub position: u64,
+    /// Total matches, when `calculate_total` was set.
+    pub total: Option<u64>,
+    /// Opaque server state string for this query, letting a client tell whether
+    /// the result set has changed since it last looked.
+    pub query_state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +573,12 @@ struct EmailSetResponse {
     created: Option<HashMap<String, Value>>,
     #[serde(rename = "notCreated")]
     not_created: Option<HashMap<String, Value>>,
+}
+
+#[derive(Deserialize)]
+struct DestroyResponse {
+    #[serde(rename = "notDestroyed")]
+    not_destroyed: Option<HashMap<String, Value>>,
 }
 
 #[derive(Deserialize)]
@@ -371,8 +656,9 @@ fn pick_identity(identities: Vec<Identity>, from: Option<&str>) -> Result<Identi
 /// requested and filtering out the sending identity.
 ///
 /// Returns `(to, cc)` where:
-/// - `to` always starts with `original.from`. When `reply_all` is set, the
-///   original `To` recipients are appended (minus `my_email` if provided).
+/// - `to` starts with `original.reply_to` when the sender set one, otherwise
+///   `original.from`. When `reply_all` is set, the original `To` recipients are
+///   appended (minus `my_email` if provided).
 /// - `cc` starts with the caller-supplied `extra_cc`. When `reply_all` is
 ///   set, the original `Cc` recipients are appended (minus `my_email`).
 ///
@@ -398,7 +684,16 @@ pub fn expand_reply_recipients(
             .is_some_and(|m| addr.email.eq_ignore_ascii_case(m))
     };
 
-    let mut to_addrs: Vec<EmailAddress> = original.from.clone().unwrap_or_default();
+    // Reply-To wins over From, as in any mail client. Transactional and support
+    // senders routinely put a branded, undeliverable address in From and the
+    // inbox that actually receives mail in Reply-To — replying to From then
+    // bounces.
+    let mut to_addrs: Vec<EmailAddress> = original
+        .reply_to
+        .clone()
+        .filter(|addrs| !addrs.is_empty())
+        .or_else(|| original.from.clone())
+        .unwrap_or_default();
     if reply_all && let Some(ref orig_to) = original.to {
         for addr in orig_to {
             if !is_me(addr) {
@@ -430,100 +725,6 @@ fn dedup_by_email(addrs: &mut Vec<EmailAddress>) {
     addrs.retain(|a| seen.insert(a.email.to_lowercase()));
 }
 
-/// Translate a [`SearchFilter`] and optional mailbox ID into a JMAP
-/// `Email/query` filter tree.
-///
-/// Single-value fields collapse into a flat FilterCondition object
-/// (`{from: "x", subject: "y"}`). Address fields (`from`/`to`/`cc`/`bcc`)
-/// with >1 entries become a JMAP OR FilterOperator on that field. When
-/// both a flat condition and one or more OR operators exist, they combine
-/// under a top-level AND. Empty filter → `{}`.
-///
-/// Preserving the flat shape for single-value-only calls keeps the wire
-/// format byte-identical to pre-multi-value behaviour for existing
-/// consumers.
-fn build_jmap_filter(filter: &SearchFilter, mailbox_id: Option<&str>) -> Value {
-    let mut flat = serde_json::Map::new();
-    let mut or_conditions: Vec<Value> = Vec::new();
-
-    if let Some(t) = &filter.text {
-        flat.insert("text".into(), json!(t));
-    }
-    if let Some(s) = &filter.subject {
-        flat.insert("subject".into(), json!(s));
-    }
-    if let Some(b) = &filter.body {
-        flat.insert("body".into(), json!(b));
-    }
-    if let Some(m) = mailbox_id {
-        flat.insert("inMailbox".into(), json!(m));
-    }
-    if filter.has_attachment {
-        flat.insert("hasAttachment".into(), json!(true));
-    }
-    if let Some(min) = filter.min_size {
-        flat.insert("minSize".into(), json!(min));
-    }
-    if let Some(max) = filter.max_size {
-        flat.insert("maxSize".into(), json!(max));
-    }
-    if let Some(before) = &filter.before {
-        let date = if before.contains('T') {
-            before.clone()
-        } else {
-            format!("{before}T00:00:00Z")
-        };
-        flat.insert("before".into(), json!(date));
-    }
-    if let Some(after) = &filter.after {
-        let date = if after.contains('T') {
-            after.clone()
-        } else {
-            format!("{after}T00:00:00Z")
-        };
-        flat.insert("after".into(), json!(date));
-    }
-    if filter.unread {
-        flat.insert("notKeyword".into(), json!("$seen"));
-    }
-    if filter.flagged {
-        flat.insert("hasKeyword".into(), json!("$flagged"));
-    }
-
-    // Address fields: single-value → flat; multi-value → OR FilterOperator.
-    for (name, values) in [
-        ("from", &filter.from),
-        ("to", &filter.to),
-        ("cc", &filter.cc),
-        ("bcc", &filter.bcc),
-    ] {
-        match values.len() {
-            0 => {}
-            1 => {
-                flat.insert(name.into(), json!(&values[0]));
-            }
-            _ => {
-                let conds: Vec<Value> = values.iter().map(|v| json!({ name: v })).collect();
-                or_conditions.push(json!({ "operator": "OR", "conditions": conds }));
-            }
-        }
-    }
-
-    match (flat.is_empty(), or_conditions.len()) {
-        (true, 0) => json!({}),
-        (false, 0) => Value::Object(flat),
-        (true, 1) => or_conditions.into_iter().next().unwrap(),
-        _ => {
-            let mut all: Vec<Value> = Vec::with_capacity(or_conditions.len() + 1);
-            if !flat.is_empty() {
-                all.push(Value::Object(flat));
-            }
-            all.extend(or_conditions);
-            json!({ "operator": "AND", "conditions": all })
-        }
-    }
-}
-
 impl JmapClient {
     pub fn new(token: String) -> Self {
         let client = Client::builder()
@@ -534,10 +735,41 @@ impl JmapClient {
         Self {
             client,
             token,
+            session_url: SESSION_URL.to_string(),
             session: None,
             available_capabilities: Vec::new(),
             cached_mailboxes: None,
         }
+    }
+
+    /// Build a client that is already "authenticated" against `api_url`, so
+    /// tests can point it at a mock JMAP server without going through the
+    /// real session endpoint. Re-authentication is redirected there too, so
+    /// tests can exercise the handshake itself.
+    #[cfg(test)]
+    pub fn with_test_session(api_url: &str) -> Self {
+        let mut client = Self::new("test-token".into());
+        client.session_url = format!("{api_url}/session");
+        client.available_capabilities =
+            DESIRED_CAPABILITIES.iter().map(|s| s.to_string()).collect();
+        client.session = Some(Session {
+            capabilities: DESIRED_CAPABILITIES
+                .iter()
+                .map(|c| (c.to_string(), json!({})))
+                .collect(),
+            accounts: HashMap::new(),
+            primary_accounts: HashMap::from([(
+                "urn:ietf:params:jmap:mail".to_string(),
+                "acct1".to_string(),
+            )]),
+            username: "test@example.com".into(),
+            api_url: api_url.to_string(),
+            download_url: format!("{api_url}/download/{{blobId}}"),
+            upload_url: format!("{api_url}/upload"),
+            event_source_url: None,
+            state: None,
+        });
+        client
     }
 
     #[instrument(skip(self))]
@@ -545,7 +777,7 @@ impl JmapClient {
         debug!("Fetching JMAP session");
         let resp = self
             .client
-            .get(SESSION_URL)
+            .get(&self.session_url)
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -665,12 +897,15 @@ impl JmapClient {
         })
     }
 
+    /// Fetch the mailbox list from the server, always. Takes `&self` so callers
+    /// holding a shared client can use it concurrently.
+    ///
+    /// This is the primitive the GraphQL mailbox loader wraps: the loader has a
+    /// request-scoped cache of its own, and a cache *here* would outlive the
+    /// request — clients are pooled per token for the life of the process, so a
+    /// folder created after start-up would never appear.
     #[instrument(skip(self))]
-    pub async fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
-        if let Some(ref cached) = self.cached_mailboxes {
-            return Ok(cached.clone());
-        }
-
+    pub async fn fetch_mailboxes(&self) -> Result<Vec<Mailbox>> {
         let account_id = self.account_id()?;
 
         let responses = self
@@ -681,7 +916,8 @@ impl JmapClient {
                     "properties": [
                         "id", "name", "parentId", "role",
                         "totalEmails", "unreadEmails",
-                        "totalThreads", "unreadThreads", "sortOrder"
+                        "totalThreads", "unreadThreads", "sortOrder",
+                        "isSubscribed", "myRights"
                     ]
                 },
                 "m0"
@@ -691,8 +927,22 @@ impl JmapClient {
         let resp: GetResponse<Mailbox> =
             Self::parse_response(responses.first().unwrap_or(&Value::Null), "Mailbox/get")?;
 
-        self.cached_mailboxes = Some(resp.list.clone());
         Ok(resp.list)
+    }
+
+    /// Mailbox list, memoised for the life of this client.
+    ///
+    /// For the CLI, where the process is short-lived and several commands walk
+    /// the folder tree in one run. Long-lived callers want
+    /// [`Self::fetch_mailboxes`] instead.
+    #[instrument(skip(self))]
+    pub async fn list_mailboxes(&mut self) -> Result<Vec<Mailbox>> {
+        if let Some(ref cached) = self.cached_mailboxes {
+            return Ok(cached.clone());
+        }
+        let mailboxes = self.fetch_mailboxes().await?;
+        self.cached_mailboxes = Some(mailboxes.clone());
+        Ok(mailboxes)
     }
 
     pub async fn find_mailbox(&mut self, name: &str) -> Result<Mailbox> {
@@ -733,6 +983,84 @@ impl JmapClient {
             .ok_or_else(|| Error::MailboxNotFound(format!("role={role}")))
     }
 
+    /// One window of an `Email/query` result.
+    #[instrument(skip(self, query))]
+    pub async fn query_emails(&self, query: EmailQuery) -> Result<EmailPage> {
+        let account_id = self.account_id()?;
+
+        let mut args = json!({
+            "accountId": account_id,
+            "filter": query.filter,
+            "sort": query.sort,
+            "limit": query.limit,
+            "calculateTotal": query.calculate_total,
+            "collapseThreads": query.collapse_threads
+        });
+        match query.start {
+            QueryStart::Position(p) => args["position"] = json!(p),
+            QueryStart::Anchor { ref id, offset } => {
+                args["anchor"] = json!(id);
+                args["anchorOffset"] = json!(offset);
+            }
+        }
+
+        let mut method_calls = vec![json!(["Email/query", args, "q0"])];
+
+        // Chain the summary fetch off the query with a JMAP back-reference, so a
+        // page costs one HTTP round trip rather than two. Skipped entirely when
+        // the caller only wants counts.
+        if query.fetch_summaries {
+            let properties: Vec<&str> = query.properties.as_ref().map_or_else(
+                || EMAIL_SUMMARY_PROPERTIES.to_vec(),
+                |p| p.iter().map(String::as_str).collect(),
+            );
+            method_calls.push(json!([
+                "Email/get",
+                {
+                    "accountId": account_id,
+                    "#ids": {
+                        "resultOf": "q0",
+                        "name": "Email/query",
+                        "path": "/ids"
+                    },
+                    "properties": properties
+                },
+                "g0"
+            ]));
+        }
+
+        let responses = self.request(method_calls).await?;
+
+        let query_resp: QueryResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
+
+        let mut emails = Vec::new();
+        if query.fetch_summaries {
+            let get_resp: GetResponse<Email> =
+                Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
+            // `Email/get` makes no ordering guarantee, so restore the sort order
+            // the query asked for rather than trusting the response order.
+            let mut by_id: HashMap<&str, Email> = get_resp
+                .list
+                .iter()
+                .map(|e| (e.id.as_str(), e.clone()))
+                .collect();
+            emails = query_resp
+                .ids
+                .iter()
+                .filter_map(|id| by_id.remove(id.as_str()))
+                .collect();
+        }
+
+        Ok(EmailPage {
+            emails,
+            ids: query_resp.ids,
+            position: query_resp.position,
+            total: query_resp.total,
+            query_state: query_resp.query_state,
+        })
+    }
+
     #[instrument(skip(self))]
     pub async fn list_emails(
         &self,
@@ -741,63 +1069,210 @@ impl JmapClient {
         offset: u32,
         properties: Option<&[&str]>,
     ) -> Result<EmailPage> {
+        self.query_emails(EmailQuery {
+            filter: json!({ "inMailbox": mailbox_id }),
+            start: QueryStart::Position(i64::from(offset)),
+            calculate_total: true,
+            properties: properties.map(|p| p.iter().map(|s| (*s).to_string()).collect()),
+            ..EmailQuery::first(limit)
+        })
+        .await
+    }
+
+    /// Fetch full content — bodies, attachment metadata, threading headers — for
+    /// many emails in a **single** `Email/get` call.
+    ///
+    /// IDs that don't exist are simply absent from the result; the caller decides
+    /// whether that is an error. This is the batch primitive behind the GraphQL
+    /// email DataLoader.
+    #[instrument(skip(self))]
+    pub async fn get_emails(&self, ids: &[String]) -> Result<Vec<Email>> {
+        self.get_email_records(ids, EMAIL_FULL_PROPERTIES, true)
+            .await
+    }
+
+    /// Summary records for known IDs — the cheap counterpart to [`Self::get_emails`].
+    ///
+    /// `Email/query` already returns summaries for the page it matched; this is
+    /// for the callers that arrive holding IDs from somewhere else, such as
+    /// `Email/changes`.
+    #[instrument(skip(self))]
+    pub async fn get_email_summaries(&self, ids: &[String]) -> Result<Vec<Email>> {
+        self.get_email_records(ids, EMAIL_SUMMARY_PROPERTIES, false)
+            .await
+    }
+
+    async fn get_email_records(
+        &self,
+        ids: &[String],
+        properties: &[&str],
+        fetch_bodies: bool,
+    ) -> Result<Vec<Email>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let account_id = self.account_id()?;
 
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
-
         let responses = self
-            .request(vec![
-                json!([
-                    "Email/query",
-                    {
-                        "accountId": account_id,
-                        "filter": { "inMailbox": mailbox_id },
-                        "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit,
-                        "position": offset,
-                        "calculateTotal": true
-                    },
-                    "q0"
-                ]),
-                json!([
-                    "Email/get",
-                    {
-                        "accountId": account_id,
-                        "#ids": {
-                            "resultOf": "q0",
-                            "name": "Email/query",
-                            "path": "/ids"
-                        },
-                        "properties": props
-                    },
-                    "g0"
-                ]),
-            ])
+            .request(vec![json!([
+                "Email/get",
+                {
+                    "accountId": account_id,
+                    "ids": ids,
+                    "properties": properties,
+                    "fetchTextBodyValues": fetch_bodies,
+                    "fetchHTMLBodyValues": fetch_bodies
+                },
+                "g0"
+            ])])
             .await?;
 
-        let query: EmailQueryMeta =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
         let resp: GetResponse<Email> =
-            Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
 
-        Ok(EmailPage {
-            emails: resp.list,
-            total: query.total,
-        })
+        Ok(resp.list)
+    }
+
+    /// The account's current `Email` state string: the cursor
+    /// [`Self::email_changes`] reads forward from.
+    ///
+    /// Fetched with an empty `ids` list, so the server returns the state and no
+    /// mail.
+    #[instrument(skip(self))]
+    pub async fn email_state(&self) -> Result<String> {
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "Email/get",
+                { "accountId": account_id, "ids": [] },
+                "s0"
+            ])])
+            .await?;
+
+        #[derive(Deserialize)]
+        struct StateOnly {
+            state: String,
+        }
+
+        let resp: StateOnly =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
+        Ok(resp.state)
+    }
+
+    /// IDs of emails created since `since_state`, and the state they leave the
+    /// caller at.
+    ///
+    /// Follows `hasMoreChanges` to the end, so the returned state is always
+    /// current: a partial read would silently drop everything past the first
+    /// page on the next call. Only creations are reported — a watcher wants
+    /// arrivals, and updates would replay every flag change as news.
+    ///
+    /// Fails with a `cannotCalculateChanges` JMAP error when the server has
+    /// discarded history back that far; the caller resyncs via
+    /// [`Self::email_state`].
+    #[instrument(skip(self))]
+    pub async fn email_changes(&self, since_state: &str) -> Result<EmailChanges> {
+        let account_id = self.account_id()?;
+        let mut state = since_state.to_string();
+        let mut created = Vec::new();
+
+        loop {
+            let responses = self
+                .request(vec![json!([
+                    "Email/changes",
+                    {
+                        "accountId": account_id,
+                        "sinceState": state,
+                        "maxChanges": CHANGES_PAGE
+                    },
+                    "c0"
+                ])])
+                .await?;
+
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct ChangesResponse {
+                new_state: String,
+                #[serde(default)]
+                has_more_changes: bool,
+                #[serde(default)]
+                created: Vec<String>,
+            }
+
+            let resp: ChangesResponse =
+                Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/changes")?;
+
+            created.extend(resp.created);
+            state = resp.new_state;
+
+            if !resp.has_more_changes {
+                return Ok(EmailChanges {
+                    new_state: state,
+                    created,
+                });
+            }
+        }
+    }
+
+    /// Open the JMAP push channel and return the live response to read frames
+    /// from.
+    ///
+    /// `last_event_id` asks the server to replay from where a dropped
+    /// connection left off. Missing it is not a correctness problem — the
+    /// caller holds its own `Email` state and reconciles through
+    /// [`Self::email_changes`] — but it saves a round trip.
+    #[instrument(skip(self))]
+    pub async fn open_event_stream(
+        &self,
+        ping: u32,
+        last_event_id: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let template = self
+            .session()?
+            .event_source_url
+            .as_deref()
+            .ok_or_else(|| {
+                Error::Config(
+                    "Server advertises no eventSourceUrl for push. Use --poll to fall back to \
+                     periodic checks."
+                        .into(),
+                )
+            })?
+            .to_string();
+
+        let url = template
+            .replace("{types}", "Email")
+            .replace("{closeafter}", "no")
+            .replace("{ping}", &ping.to_string());
+
+        // The shared client caps every request at 30s; a push channel is meant
+        // to stay open for days. A read timeout of a few ping intervals stands
+        // in for it, so silence reads as a dead connection rather than an idle
+        // one — the difference between reconnecting and hanging forever.
+        let client = Client::builder()
+            .read_timeout(Duration::from_secs(u64::from(ping) * 3))
+            .build()?;
+
+        let mut req = client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header("Accept", "text/event-stream");
+        if let Some(id) = last_event_id {
+            req = req.header("Last-Event-ID", id);
+        }
+
+        debug!(url = %url, "Opening JMAP event source");
+        let resp = req.send().await?;
+
+        match resp.status().as_u16() {
+            401 => return Err(Error::InvalidToken("Token expired or invalid")),
+            429 => return Err(Error::RateLimited),
+            500..=599 => return Err(Error::Server(format!("Server error: {}", resp.status()))),
+            _ => {}
+        }
+
+        Ok(resp)
     }
 
     #[instrument(skip(self))]
@@ -807,89 +1282,38 @@ impl JmapClient {
         properties: Option<&[&str]>,
         fetch_body_values: bool,
     ) -> Result<Email> {
-        let account_id = self.account_id()?;
-
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "blobId",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "messageId",
-            "inReplyTo",
-            "references",
-            "from",
-            "to",
-            "cc",
-            "bcc",
-            "replyTo",
-            "subject",
-            "sentAt",
-            "preview",
-            "hasAttachment",
-            "textBody",
-            "htmlBody",
-            "attachments",
-            "bodyValues",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
-
-        let responses = self
-            .request(vec![json!([
-                "Email/get",
-                {
-                    "accountId": account_id,
-                    "ids": [email_id],
-                    "properties": props,
-                    "fetchTextBodyValues": fetch_body_values,
-                    "fetchHTMLBodyValues": fetch_body_values
-                },
-                "g0"
-            ])])
-            .await?;
-
-        let resp: GetResponseWithNotFound<Email> =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
-
-        if !resp.not_found.is_empty() {
-            return Err(Error::EmailNotFound(email_id.into()));
-        }
-
-        resp.list
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::EmailNotFound(email_id.into()))
+        let ids = [email_id.to_string()];
+        self.get_email_records(
+            &ids,
+            properties.unwrap_or(EMAIL_FULL_PROPERTIES),
+            fetch_body_values,
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::EmailNotFound(email_id.into()))
     }
 
-    /// Get all emails in a thread
+    /// Resolve thread IDs to their member email IDs in a single `Thread/get`.
+    ///
+    /// Threads that don't exist are absent from the map. This is the batch
+    /// primitive behind the GraphQL thread DataLoader.
     #[instrument(skip(self))]
-    pub async fn get_thread(
+    pub async fn thread_email_ids(
         &self,
-        email_id: &str,
-        properties: Option<&[&str]>,
-        fetch_body_values: bool,
-    ) -> Result<Vec<Email>> {
+        thread_ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>> {
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let account_id = self.account_id()?;
 
-        // First look up the email just to get its threadId. Always uses a
-        // minimal fetch — we don't care about the first email's properties
-        // at this stage.
-        let email = self
-            .get_email(email_id, Some(&["id", "threadId"]), false)
-            .await?;
-        let thread_id = email
-            .thread_id
-            .ok_or_else(|| Error::Config("Email has no thread ID".into()))?;
-
-        // Get the thread to find all email IDs
         let responses = self
             .request(vec![json!([
                 "Thread/get",
                 {
                     "accountId": account_id,
-                    "ids": [thread_id]
+                    "ids": thread_ids
                 },
                 "t0"
             ])])
@@ -897,56 +1321,44 @@ impl JmapClient {
 
         #[derive(Deserialize)]
         struct Thread {
+            id: String,
             #[serde(rename = "emailIds")]
             email_ids: Vec<String>,
         }
 
-        let thread_resp: GetResponse<Thread> =
+        let resp: GetResponse<Thread> =
             Self::parse_response(responses.first().unwrap_or(&Value::Null), "Thread/get")?;
 
-        let thread = thread_resp
-            .list
-            .into_iter()
-            .next()
+        Ok(resp.list.into_iter().map(|t| (t.id, t.email_ids)).collect())
+    }
+
+    /// Get all emails in a thread, with full content.
+    #[instrument(skip(self))]
+    pub async fn get_thread(
+        &self,
+        email_id: &str,
+        properties: Option<&[&str]>,
+        fetch_body_values: bool,
+    ) -> Result<Vec<Email>> {
+        let email = self
+            .get_email(email_id, Some(&["id", "threadId"]), false)
+            .await?;
+        let thread_id = email
+            .thread_id
+            .ok_or_else(|| Error::Config("Email has no thread ID".into()))?;
+
+        let ids = self
+            .thread_email_ids(std::slice::from_ref(&thread_id))
+            .await?
+            .remove(&thread_id)
             .ok_or_else(|| Error::Config("Thread not found".into()))?;
 
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-            "textBody",
-            "htmlBody",
-            "bodyValues",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
-
-        let responses = self
-            .request(vec![json!([
-                "Email/get",
-                {
-                    "accountId": account_id,
-                    "ids": thread.email_ids,
-                    "properties": props,
-                    "fetchTextBodyValues": fetch_body_values,
-                    "fetchHTMLBodyValues": fetch_body_values
-                },
-                "e0"
-            ])])
-            .await?;
-
-        let resp: GetResponse<Email> =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/get")?;
-
-        Ok(resp.list)
+        self.get_email_records(
+            &ids,
+            properties.unwrap_or(EMAIL_FULL_PROPERTIES),
+            fetch_body_values,
+        )
+        .await
     }
 
     /// Search emails with full JMAP filter support
@@ -959,64 +1371,14 @@ impl JmapClient {
         offset: u32,
         properties: Option<&[&str]>,
     ) -> Result<EmailPage> {
-        let account_id = self.account_id()?;
-        let jmap_filter = build_jmap_filter(filter, mailbox_id);
-
-        const DEFAULT_PROPS: &[&str] = &[
-            "id",
-            "threadId",
-            "mailboxIds",
-            "keywords",
-            "size",
-            "receivedAt",
-            "from",
-            "to",
-            "cc",
-            "subject",
-            "preview",
-            "hasAttachment",
-        ];
-        let props = properties.unwrap_or(DEFAULT_PROPS);
-
-        let responses = self
-            .request(vec![
-                json!([
-                    "Email/query",
-                    {
-                        "accountId": account_id,
-                        "filter": jmap_filter,
-                        "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "limit": limit,
-                        "position": offset,
-                        "calculateTotal": true
-                    },
-                    "q0"
-                ]),
-                json!([
-                    "Email/get",
-                    {
-                        "accountId": account_id,
-                        "#ids": {
-                            "resultOf": "q0",
-                            "name": "Email/query",
-                            "path": "/ids"
-                        },
-                        "properties": props
-                    },
-                    "g0"
-                ]),
-            ])
-            .await?;
-
-        let query: EmailQueryMeta =
-            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
-        let resp: GetResponse<Email> =
-            Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
-
-        Ok(EmailPage {
-            emails: resp.list,
-            total: query.total,
+        self.query_emails(EmailQuery {
+            filter: search_filter_to_jmap(filter, mailbox_id),
+            start: QueryStart::Position(i64::from(offset)),
+            calculate_total: true,
+            properties: properties.map(|p| p.iter().map(|s| (*s).to_string()).collect()),
+            ..EmailQuery::first(limit)
         })
+        .await
     }
 
     #[instrument(skip(self))]
@@ -1164,16 +1526,7 @@ impl JmapClient {
         }
         email_create.insert("subject".into(), json!(draft.subject));
 
-        // Upload attachments and collect blob IDs
-        let mut uploaded_attachments: Vec<UploadedAttachment> = Vec::new();
-        for att in draft.attachments {
-            let blob_id = self.upload_blob(att.data, &att.content_type).await?;
-            uploaded_attachments.push(UploadedAttachment {
-                blob_id,
-                filename: att.filename,
-                content_type: att.content_type,
-            });
-        }
+        let uploaded_attachments = self.upload_attachments(draft.attachments).await?;
 
         apply_body_structure(
             &mut email_create,
@@ -1198,6 +1551,42 @@ impl JmapClient {
         Ok(email_id)
     }
 
+    async fn find_reply_parent(&self, message_id: &str) -> Result<Option<Email>> {
+        let account_id = self.account_id()?;
+        let responses = self
+            .request(vec![
+                json!([
+                    "Email/query",
+                    {
+                        "accountId": account_id,
+                        "filter": { "header": ["Message-ID", message_id] },
+                        "limit": 5
+                    },
+                    "q0"
+                ]),
+                json!([
+                    "Email/get",
+                    {
+                        "accountId": account_id,
+                        "#ids": { "resultOf": "q0", "name": "Email/query", "path": "/ids" },
+                        "properties": ["id", "messageId", "references"]
+                    },
+                    "g0"
+                ]),
+            ])
+            .await?;
+        let _: QueryResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/query")?;
+        let resp: GetResponse<Email> =
+            Self::parse_response(responses.get(1).unwrap_or(&Value::Null), "Email/get")?;
+        Ok(resp.list.into_iter().find(|email| {
+            email
+                .message_id
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| id == message_id))
+        }))
+    }
+
     #[instrument(skip(self, body, params))]
     pub async fn send_email(
         &mut self,
@@ -1208,6 +1597,22 @@ impl JmapClient {
         params: ComposeParams<'_>,
     ) -> Result<String> {
         let ctx = self.prepare_compose(params.from, params.draft).await?;
+        let threading = if let Some(id) = in_reply_to {
+            let fallback = reply_threading(id, None);
+            match self.find_reply_parent(&fallback.in_reply_to[0]).await {
+                Ok(Some(parent)) => Some(reply_threading(id, parent.references.as_deref())),
+                Ok(None) => {
+                    debug!("Reply parent not found; using the supplied Message-ID for threading");
+                    Some(fallback)
+                }
+                Err(error) => {
+                    debug!(%error, "Reply parent lookup failed; using the supplied Message-ID for threading");
+                    Some(fallback)
+                }
+            }
+        } else {
+            None
+        };
         self.create_and_submit_email(
             &ctx,
             EmailDraft {
@@ -1218,10 +1623,7 @@ impl JmapClient {
                 body,
                 html_body: params.html_body.as_deref(),
                 attachments: params.attachments,
-                threading: in_reply_to.map(|id| ThreadingHeaders {
-                    in_reply_to: vec![id.to_string()],
-                    references: vec![],
-                }),
+                threading,
             },
         )
         .await
@@ -1279,6 +1681,28 @@ impl JmapClient {
     /// Download a blob (attachment) by ID
     #[instrument(skip(self))]
     pub async fn download_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        let bytes = self.fetch_blob(blob_id).await?.bytes().await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// A blob's size, read no further than `limit` bytes: past that, `limit + 1`.
+    /// Fastmail does not offer `Blob/get`, so this is a download, ended early.
+    pub async fn blob_size(&self, blob_id: &str, limit: usize) -> Result<usize> {
+        let mut resp = self.fetch_blob(blob_id).await?;
+        if let Some(len) = resp.content_length() {
+            return Ok(usize::try_from(len).unwrap_or(usize::MAX));
+        }
+        let mut size = 0;
+        while let Some(chunk) = resp.chunk().await? {
+            size += chunk.len();
+            if size > limit {
+                return Ok(limit + 1);
+            }
+        }
+        Ok(size)
+    }
+
+    async fn fetch_blob(&self, blob_id: &str) -> Result<reqwest::Response> {
         let account_id = self.account_id()?;
         let session = self.session()?;
 
@@ -1309,11 +1733,35 @@ impl JmapClient {
             404 => return Err(Error::Config(format!("Blob not found: {}", blob_id))),
             429 => return Err(Error::RateLimited),
             500..=599 => return Err(Error::Server(format!("Server error: {}", resp.status()))),
-            _ => {}
+            200..=299 => {}
+            code => {
+                return Err(Error::Server(format!(
+                    "Download of blob {blob_id} failed ({code})"
+                )));
+            }
         }
+        Ok(resp)
+    }
 
-        let bytes = resp.bytes().await?;
-        Ok(bytes.to_vec())
+    /// Upload whatever attachments are still bytes; blobs pass through as they are.
+    async fn upload_attachments(
+        &self,
+        attachments: Vec<AttachmentData>,
+    ) -> Result<Vec<UploadedAttachment>> {
+        let mut uploaded = Vec::with_capacity(attachments.len());
+        for att in attachments {
+            let blob_id = match att.content {
+                AttachmentContent::Bytes(data) => self.upload_blob(data, &att.content_type).await?,
+                AttachmentContent::Blob(id) => id,
+            };
+            uploaded.push(UploadedAttachment {
+                blob_id,
+                filename: att.filename,
+                content_type: att.content_type,
+                inline_cid: None,
+            });
+        }
+        Ok(uploaded)
     }
 
     /// Upload a blob (for attachments) and return the blobId
@@ -1454,6 +1902,193 @@ impl JmapClient {
             },
         )
         .await
+    }
+
+    /// Rewrite a draft. JMAP emails are immutable apart from their keywords
+    /// and mailboxes, so this creates the edited copy and then destroys the
+    /// original. The two happen in separate requests: in a single `Email/set`
+    /// the destroy would still run when the create failed, losing the draft.
+    ///
+    /// Everything `edit` leaves as `None` is carried over, including threading
+    /// headers, keywords, mailboxes and attachments (by blob, so nothing is
+    /// re-uploaded). Returns the new draft's ID.
+    #[instrument(skip(self, draft, edit))]
+    pub async fn replace_draft(&self, draft: &Email, edit: DraftEdit) -> Result<String> {
+        if !draft.is_draft() {
+            return Err(Error::NotADraft(draft.id.clone()));
+        }
+        let account_id = self.account_id()?;
+
+        let from = match edit.from {
+            Some(ref email) => {
+                let identity = self.resolve_identity(Some(email)).await?;
+                Some(vec![EmailAddress {
+                    name: Some(identity.name),
+                    email: identity.email,
+                }])
+            }
+            None => draft.from.clone(),
+        };
+
+        // A new plain-text body replaces the HTML alternative too, unless one
+        // is supplied alongside it: keeping the old HTML would leave the two
+        // parts saying different things.
+        let (text, html) = match (edit.body, edit.html_body) {
+            (Some(text), html) => (text, html),
+            (None, Some(html)) => (draft.text_content().unwrap_or_default(), Some(html)),
+            (None, None) => (
+                draft.text_content().unwrap_or_default(),
+                draft.html_content(),
+            ),
+        };
+
+        let mut attachments: Vec<UploadedAttachment> = draft
+            .attachments
+            .iter()
+            .flatten()
+            .filter_map(|part| {
+                Some(UploadedAttachment {
+                    blob_id: part.blob_id.clone()?,
+                    filename: part.name.clone().unwrap_or_else(|| "attachment".into()),
+                    content_type: part
+                        .content_type
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".into()),
+                    inline_cid: part
+                        .cid
+                        .clone()
+                        .filter(|_| part.disposition.as_deref() == Some("inline")),
+                })
+            })
+            .collect();
+        if let Some(replacements) = edit.attachments {
+            attachments.retain(|a| {
+                a.inline_cid.as_ref().is_some_and(|cid| {
+                    html.as_deref()
+                        .is_some_and(|h| h.contains(&format!("cid:{cid}")))
+                })
+            });
+            attachments.extend(self.upload_attachments(replacements).await?);
+        }
+
+        let mut email_create: HashMap<String, Value> = HashMap::new();
+        email_create.insert("mailboxIds".into(), json!(draft.mailbox_ids));
+        email_create.insert("keywords".into(), json!(draft.keywords));
+        let fields = [
+            ("from", from),
+            ("to", edit.to.or_else(|| draft.to.clone())),
+            ("cc", edit.cc.or_else(|| draft.cc.clone())),
+            ("bcc", edit.bcc.or_else(|| draft.bcc.clone())),
+            ("replyTo", draft.reply_to.clone()),
+        ];
+        for (key, addrs) in fields {
+            if let Some(addrs) = addrs.filter(|a| !a.is_empty()) {
+                email_create.insert(key.into(), json!(addrs));
+            }
+        }
+        email_create.insert(
+            "subject".into(),
+            json!(
+                edit.subject
+                    .or_else(|| draft.subject.clone())
+                    .unwrap_or_default()
+            ),
+        );
+        if let Some(ref ids) = draft.in_reply_to {
+            email_create.insert("inReplyTo".into(), json!(ids));
+        }
+        if let Some(ref ids) = draft.references {
+            email_create.insert("references".into(), json!(ids));
+        }
+        apply_body_structure(&mut email_create, &text, html.as_deref(), &attachments);
+
+        let responses = self
+            .request(vec![json!([
+                "Email/set",
+                { "accountId": account_id, "create": { "email": email_create } },
+                "d0"
+            ])])
+            .await?;
+        let new_id = Self::parse_email_create_response(&responses)?;
+
+        let responses = self
+            .request(vec![json!([
+                "Email/set",
+                { "accountId": account_id, "destroy": [draft.id] },
+                "d1"
+            ])])
+            .await?;
+        let resp: DestroyResponse =
+            Self::parse_response(responses.first().unwrap_or(&Value::Null), "Email/set")?;
+        if let Some(err) = resp.not_destroyed.as_ref().and_then(|m| m.get(&draft.id)) {
+            return Err(Error::Jmap {
+                method: "Email/set".into(),
+                error_type: err["type"].as_str().unwrap_or("unknown").into(),
+                description: format!(
+                    "saved the edit as {new_id} but could not remove the original draft {}: {}",
+                    draft.id,
+                    err["description"].as_str().unwrap_or("no description")
+                ),
+            });
+        }
+
+        debug!(old = %draft.id, new = %new_id, "Draft replaced");
+        Ok(new_id)
+    }
+
+    /// Submit an existing draft. On success the server moves it to Sent and
+    /// drops `$draft`, which is what the web client does.
+    #[instrument(skip(self, draft))]
+    pub async fn send_draft(&mut self, draft: &Email) -> Result<()> {
+        self.require_capability("urn:ietf:params:jmap:submission", "Email sending")?;
+        if !draft.is_draft() {
+            return Err(Error::NotADraft(draft.id.clone()));
+        }
+        let from = draft.from.as_ref().and_then(|f| f.first()).ok_or_else(|| {
+            Error::Config(format!(
+                "Draft {} has no From address. Set one by editing the draft first.",
+                draft.id
+            ))
+        })?;
+        let identity = self.resolve_identity(Some(&from.email)).await?;
+        let sent = self.find_mailbox_by_role("sent").await?;
+        let account_id = self.account_id()?;
+
+        let responses = self
+            .request(vec![json!([
+                "EmailSubmission/set",
+                {
+                    "accountId": account_id,
+                    "create": {
+                        "submission": { "identityId": identity.id, "emailId": draft.id }
+                    },
+                    "onSuccessUpdateEmail": {
+                        "#submission": {
+                            "mailboxIds": { (sent.id): true },
+                            "keywords/$draft": null,
+                            "keywords/$seen": true
+                        }
+                    }
+                },
+                "s0"
+            ])])
+            .await?;
+
+        let resp: EmailSetResponse = Self::parse_response(
+            responses.first().unwrap_or(&Value::Null),
+            "EmailSubmission/set",
+        )?;
+        if let Some(err) = resp.not_created.as_ref().and_then(|m| m.get("submission")) {
+            return Err(Error::Jmap {
+                method: "EmailSubmission/set".into(),
+                error_type: err["type"].as_str().unwrap_or("unknown").into(),
+                description: err["description"]
+                    .as_str()
+                    .unwrap_or("Draft submission failed")
+                    .into(),
+            });
+        }
+        Ok(())
     }
 
     #[instrument(skip(self))]
@@ -1654,6 +2289,184 @@ impl JmapClient {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reply_threading_normalizes_bracketed_and_bare_ids() {
+        for id in [
+            "abc@example.com",
+            "  <abc@example.com>\n",
+            " abc@example.com ",
+        ] {
+            let headers = reply_threading(id, None);
+            assert_eq!(headers.in_reply_to, ["abc@example.com"]);
+            assert_eq!(headers.references, ["abc@example.com"]);
+        }
+    }
+
+    #[test]
+    fn reply_threading_preserves_parent_references() {
+        let refs = vec!["first@example.com".into(), "second@example.com".into()];
+        let headers = reply_threading("abc@example.com", Some(&refs));
+        assert_eq!(headers.in_reply_to, ["abc@example.com"]);
+        assert_eq!(
+            headers.references,
+            ["first@example.com", "second@example.com", "abc@example.com"]
+        );
+    }
+
+    #[test]
+    fn reply_threading_parent_without_references() {
+        let headers = reply_threading("abc@example.com", Some(&[]));
+        assert_eq!(headers.references, ["abc@example.com"]);
+    }
+
+    #[test]
+    fn reply_threading_parent_not_found() {
+        let headers = reply_threading("abc@example.com", None);
+        assert_eq!(headers.references, ["abc@example.com"]);
+    }
+
+    #[test]
+    fn reply_threading_deduplicates_references_in_order() {
+        let refs = vec![
+            "first@example.com".into(),
+            "first@example.com".into(),
+            "abc@example.com".into(),
+        ];
+        let headers = reply_threading("<abc@example.com>", Some(&refs));
+        assert_eq!(headers.references, ["first@example.com", "abc@example.com"]);
+    }
+
+    #[tokio::test]
+    async fn projected_search_preserves_query_order_offset_and_total() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "methodResponses": [
+                    ["Email/query", { "ids": ["e2", "e1"], "position": 10, "total": 20 }, "q0"],
+                    ["Email/get", { "list": [{ "id": "e1" }, { "id": "e2" }] }, "g0"]
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = mock_client(&server.uri());
+        let filter = filter_with_from(vec!["a@x", "b@y"]);
+        let page = client
+            .search_emails_filtered(&filter, None, 2, 10, Some(&["id"]))
+            .await
+            .unwrap();
+        assert_eq!(
+            page.emails
+                .iter()
+                .map(|e| e.id.as_str())
+                .collect::<Vec<_>>(),
+            ["e2", "e1"]
+        );
+        assert_eq!(page.total, Some(20));
+        assert_eq!(page.position, 10);
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let query = &body["methodCalls"][0][1];
+        assert_eq!(query["position"], 10);
+        assert_eq!(query["limit"], 2);
+        assert_eq!(query["calculateTotal"], true);
+        assert_eq!(
+            query["filter"],
+            json!({ "operator": "OR", "conditions": [{ "from": "a@x" }, { "from": "b@y" }] })
+        );
+        assert_eq!(body["methodCalls"][1][1]["properties"], json!(["id"]));
+    }
+
+    #[tokio::test]
+    async fn send_email_sets_threading_headers_and_survives_lookup_failures() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for scenario in ["found", "no-references", "missing", "error", "mismatch"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let body: Value = serde_json::from_slice(&req.body).unwrap();
+                    let calls = body["methodCalls"].as_array().unwrap();
+                    let responses: Vec<Value> = calls.iter().map(|call| {
+                        let result = match call[0].as_str().unwrap() {
+                            "Identity/get" => json!({ "list": [{ "id": "i1", "name": "Me", "email": "me@example.com" }] }),
+                            "Email/query" if scenario == "error" => return json!(["error", { "type": "serverFail" }, call[2]]),
+                            "Email/query" => {
+                                assert_eq!(calls.len(), 2);
+                                assert_eq!(call[1]["filter"], json!({ "header": ["Message-ID", "abc@example.com"] }));
+                                json!({ "ids": ["parent"] })
+                            }
+                            "Email/get" => {
+                                assert_eq!(call[1]["#ids"], json!({ "resultOf": "q0", "name": "Email/query", "path": "/ids" }));
+                                assert_eq!(call[1]["properties"], json!(["id", "messageId", "references"]));
+                                let parent = json!({ "id": "parent", "messageId": ["abc@example.com"], "references": ["root@example.com"] });
+                                let mismatch = json!({ "id": "other", "messageId": ["other@example.com"], "references": ["wrong@example.com"] });
+                                match scenario {
+                                    "found" => json!({ "list": [mismatch, parent] }),
+                                    "no-references" => json!({ "list": [{ "id": "parent", "messageId": ["abc@example.com"] }] }),
+                                    "mismatch" => json!({ "list": [mismatch] }),
+                                    _ => json!({ "list": [] }),
+                                }
+                            }
+                            "Email/set" => json!({ "created": { "email": { "id": "sent" } } }),
+                            "EmailSubmission/set" => json!({ "created": { "submission": { "id": "submission" } } }),
+                            name => panic!("unexpected method: {name}"),
+                        };
+                        json!([call[0], result, call[2]])
+                    }).collect();
+                    ResponseTemplate::new(200).set_body_json(json!({ "methodResponses": responses }))
+                })
+                .mount(&server).await;
+            let mut client = mock_client(&server.uri());
+            client
+                .available_capabilities
+                .push("urn:ietf:params:jmap:submission".into());
+            client
+                .session
+                .as_mut()
+                .unwrap()
+                .capabilities
+                .insert("urn:ietf:params:jmap:submission".into(), json!({}));
+            client.cached_mailboxes = Some(vec![test_mailbox("sent", "Sent Items", Some("sent"))]);
+            let id = client
+                .send_email(
+                    vec![EmailAddress {
+                        name: None,
+                        email: "to@example.com".into(),
+                    }],
+                    "Re: subject",
+                    "reply",
+                    Some(" <abc@example.com> "),
+                    ComposeParams {
+                        cc: vec![],
+                        bcc: vec![],
+                        from: None,
+                        draft: false,
+                        html_body: None,
+                        attachments: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(id, "sent");
+            let requests = server.received_requests().await.unwrap();
+            let body: Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            let create = &body["methodCalls"][0][1]["create"]["email"];
+            assert_eq!(create["inReplyTo"], json!(["abc@example.com"]));
+            let expected = if scenario == "found" {
+                json!(["root@example.com", "abc@example.com"])
+            } else {
+                json!(["abc@example.com"])
+            };
+            assert_eq!(create["references"], expected, "{scenario}");
+            assert_eq!(body["methodCalls"][1][0], "EmailSubmission/set");
+        }
+    }
+
     fn create_test_session(capabilities: Vec<&str>) -> Session {
         let mut caps = HashMap::new();
         for cap in capabilities {
@@ -1794,28 +2607,7 @@ mod tests {
     fn reply_fixture(from: Vec<&str>, to: Vec<&str>, cc: Vec<&str>) -> Email {
         let mut email = Email {
             id: "test".into(),
-            blob_id: None,
-            thread_id: None,
-            mailbox_ids: HashMap::new(),
-            keywords: HashMap::new(),
-            size: 0,
-            received_at: None,
-            message_id: None,
-            in_reply_to: None,
-            references: None,
-            from: None,
-            to: None,
-            cc: None,
-            bcc: None,
-            reply_to: None,
-            subject: None,
-            sent_at: None,
-            preview: None,
-            has_attachment: false,
-            text_body: None,
-            html_body: None,
-            attachments: None,
-            body_values: None,
+            ..Default::default()
         };
         email.from = Some(from.iter().map(|e| addr(e)).collect());
         email.to = Some(to.iter().map(|e| addr(e)).collect());
@@ -1838,6 +2630,47 @@ mod tests {
             expand_reply_recipients(&original, false, Some("me@x"), vec![addr("user@x")]);
         assert_eq!(emails(&to), vec!["sender@x"]);
         assert_eq!(emails(&cc), vec!["user@x"]);
+    }
+
+    #[test]
+    fn test_expand_reply_prefers_reply_to_over_from() {
+        // The shape that bounces in the wild: a branded From on a domain with
+        // no MX record, and the real inbox in Reply-To.
+        let mut original = reply_fixture(vec!["noreply@branded.invalid"], vec![], vec![]);
+        original.reply_to = Some(vec![addr("support@real")]);
+
+        let (to, _) = expand_reply_recipients(&original, false, Some("me@x"), vec![]);
+        assert_eq!(emails(&to), vec!["support@real"]);
+    }
+
+    #[test]
+    fn test_expand_reply_all_uses_reply_to_as_the_sender() {
+        let mut original = reply_fixture(
+            vec!["noreply@branded.invalid"],
+            vec!["recip1@x", "me@x"],
+            vec!["cc1@x"],
+        );
+        original.reply_to = Some(vec![addr("support@real")]);
+
+        let (to, cc) = expand_reply_recipients(&original, true, Some("me@x"), vec![]);
+        // Reply-To replaces From, it does not join it: the branded address is
+        // still undeliverable on a reply-all.
+        assert_eq!(emails(&to), vec!["support@real", "recip1@x"]);
+        assert_eq!(emails(&cc), vec!["cc1@x"]);
+    }
+
+    #[test]
+    fn test_expand_reply_falls_back_to_from_when_reply_to_is_absent_or_empty() {
+        let original = reply_fixture(vec!["sender@x"], vec![], vec![]);
+        let (to, _) = expand_reply_recipients(&original, false, None, vec![]);
+        assert_eq!(emails(&to), vec!["sender@x"]);
+
+        // An empty list is not a Reply-To. Treating it as one would reply to
+        // nobody.
+        let mut empty = reply_fixture(vec!["sender@x"], vec![], vec![]);
+        empty.reply_to = Some(vec![]);
+        let (to, _) = expand_reply_recipients(&empty, false, None, vec![]);
+        assert_eq!(emails(&to), vec!["sender@x"]);
     }
 
     #[test]
@@ -1983,6 +2816,7 @@ mod tests {
             html_body,
             attachments: None,
             body_values: Some(body_values),
+            ..Default::default()
         }
     }
 
@@ -2162,6 +2996,7 @@ mod tests {
             blob_id: "Gblob123".into(),
             filename: "report.pdf".into(),
             content_type: "application/pdf".into(),
+            inline_cid: None,
         }];
         apply_body_structure(&mut email, "See attached", None, &attachments);
 
@@ -2194,6 +3029,7 @@ mod tests {
             blob_id: "Gblob456".into(),
             filename: "_DSF1117.jpg".into(),
             content_type: "image/jpeg".into(),
+            inline_cid: None,
         }];
         apply_body_structure(
             &mut email,
@@ -2237,12 +3073,14 @@ mod tests {
                 blob_id: "Ga".into(),
                 filename: "a.pdf".into(),
                 content_type: "application/pdf".into(),
+                inline_cid: None,
             },
             UploadedAttachment {
                 blob_id: "Gb".into(),
                 filename: "b.xlsx".into(),
                 content_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     .into(),
+                inline_cid: None,
             },
         ];
         apply_body_structure(&mut email, "docs attached", None, &attachments);
@@ -2254,6 +3092,193 @@ mod tests {
     }
 
     // ============ upload_blob mock test ============
+
+    /// Build a client pointed at a mock JMAP server.
+    fn mock_client(uri: &str) -> JmapClient {
+        let mut client = JmapClient::new("test-token".to_string());
+        let mut session = create_test_session(vec![
+            "urn:ietf:params:jmap:core",
+            "urn:ietf:params:jmap:mail",
+        ]);
+        session.api_url = format!("{uri}/jmap");
+        client.available_capabilities = session.capabilities.keys().cloned().collect();
+        client.session = Some(session);
+        client
+    }
+
+    /// One `methodResponses` envelope around a single method result.
+    fn jmap_response(method: &str, result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "methodResponses": [[method, result, "c0"]] })
+    }
+
+    #[tokio::test]
+    async fn test_email_state_reads_state_without_fetching_mail() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains(r#""ids":[]"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jmap_response(
+                "Email/get",
+                serde_json::json!({ "state": "state-42", "list": [], "notFound": [] }),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let client = mock_client(&mock_server.uri());
+        assert_eq!(client.email_state().await.unwrap(), "state-42");
+    }
+
+    #[tokio::test]
+    async fn test_email_changes_follows_has_more_changes() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Each page is matched by the state it was asked to start from, so the
+        // test asserts the cursor actually advances rather than trusting order.
+        Mock::given(method("POST"))
+            .and(body_string_contains(r#""sinceState":"s0""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jmap_response(
+                "Email/changes",
+                serde_json::json!({
+                    "oldState": "s0",
+                    "newState": "s1",
+                    "hasMoreChanges": true,
+                    "created": ["e1", "e2"],
+                    "updated": [],
+                    "destroyed": []
+                }),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(body_string_contains(r#""sinceState":"s1""#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jmap_response(
+                "Email/changes",
+                serde_json::json!({
+                    "oldState": "s1",
+                    "newState": "s2",
+                    "hasMoreChanges": false,
+                    "created": ["e3"],
+                    "updated": [],
+                    "destroyed": []
+                }),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let client = mock_client(&mock_server.uri());
+        let changes = client.email_changes("s0").await.unwrap();
+
+        assert_eq!(changes.created, vec!["e1", "e2", "e3"]);
+        assert_eq!(changes.new_state, "s2");
+    }
+
+    #[tokio::test]
+    async fn test_email_changes_surfaces_cannot_calculate_changes() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jmap_response(
+                "error",
+                serde_json::json!({ "type": "cannotCalculateChanges" }),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let client = mock_client(&mock_server.uri());
+        let err = client.email_changes("ancient").await.unwrap_err();
+
+        // The watcher keys its resync off this type, so it has to survive the
+        // trip through parse_response intact.
+        assert!(
+            matches!(&err, Error::Jmap { error_type, .. } if error_type == "cannotCalculateChanges"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_email_summaries_skips_body_values() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Bodies are the expensive half of Email/get; a watcher fetching them
+        // by default would make every arrival cost a full document parse.
+        Mock::given(method("POST"))
+            .and(body_string_contains(r#""fetchTextBodyValues":false"#))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jmap_response(
+                "Email/get",
+                serde_json::json!({
+                    "state": "s1",
+                    "list": [{ "id": "e1", "subject": "hi" }],
+                    "notFound": []
+                }),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let client = mock_client(&mock_server.uri());
+        let emails = client
+            .get_email_summaries(&["e1".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].subject.as_deref(), Some("hi"));
+    }
+
+    #[tokio::test]
+    async fn test_open_event_stream_fills_the_url_template() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // The session hands back a URI template; getting any placeholder wrong
+        // fails silently as "push just never fires".
+        Mock::given(method("GET"))
+            .and(path("/jmap/event-source/"))
+            .and(query_param("types", "Email"))
+            .and(query_param("closeafter", "no"))
+            .and(query_param("ping", "30"))
+            .and(header("Authorization", "Bearer test-token"))
+            .and(header("Last-Event-ID", "evt-7"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(": ping\n\n"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let mut client = mock_client(&mock_server.uri());
+        client.session.as_mut().unwrap().event_source_url = Some(format!(
+            "{}/jmap/event-source/?types={{types}}&closeafter={{closeafter}}&ping={{ping}}",
+            mock_server.uri()
+        ));
+
+        let resp = client.open_event_stream(30, Some("evt-7")).await.unwrap();
+        assert!(resp.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn test_open_event_stream_without_a_url_points_at_poll() {
+        // create_test_session advertises no eventSourceUrl, standing in for a
+        // server that does not offer push.
+        let client = mock_client("https://api.example.com");
+        let err = client.open_event_stream(30, None).await.unwrap_err();
+        assert!(err.to_string().contains("--poll"), "unhelpful error: {err}");
+    }
 
     #[tokio::test]
     async fn test_upload_blob_success() {
@@ -2346,6 +3371,8 @@ mod tests {
             total_threads: 0,
             unread_threads: 0,
             sort_order: 0,
+            is_subscribed: false,
+            my_rights: Default::default(),
         }
     }
 
@@ -2404,7 +3431,7 @@ mod tests {
             subject: Some("invoice".into()),
             ..Default::default()
         };
-        let v = build_jmap_filter(&f, None);
+        let v = search_filter_to_jmap(&f, None);
         assert_eq!(v["from"], "a@x.com");
         assert_eq!(v["subject"], "invoice");
         assert!(v.get("operator").is_none());
@@ -2413,7 +3440,7 @@ mod tests {
     #[test]
     fn build_filter_multi_from_becomes_or_operator() {
         let f = filter_with_from(vec!["a@x.com", "b@y.com"]);
-        let v = build_jmap_filter(&f, None);
+        let v = search_filter_to_jmap(&f, None);
         assert_eq!(v["operator"], "OR");
         let conds = v["conditions"].as_array().unwrap();
         assert_eq!(conds.len(), 2);
@@ -2428,7 +3455,7 @@ mod tests {
             subject: Some("flight".into()),
             ..Default::default()
         };
-        let v = build_jmap_filter(&f, None);
+        let v = search_filter_to_jmap(&f, None);
         assert_eq!(v["operator"], "AND");
         let conds = v["conditions"].as_array().unwrap();
         assert_eq!(conds.len(), 2);
@@ -2443,7 +3470,7 @@ mod tests {
             to: vec!["c@z".into(), "d@w".into()],
             ..Default::default()
         };
-        let v = build_jmap_filter(&f, None);
+        let v = search_filter_to_jmap(&f, None);
         assert_eq!(v["operator"], "AND");
         let conds = v["conditions"].as_array().unwrap();
         assert_eq!(conds.len(), 2);
@@ -2452,7 +3479,7 @@ mod tests {
 
     #[test]
     fn build_filter_empty_filter_is_empty_object() {
-        let v = build_jmap_filter(&SearchFilter::default(), None);
+        let v = search_filter_to_jmap(&SearchFilter::default(), None);
         assert_eq!(v, json!({}));
     }
 }

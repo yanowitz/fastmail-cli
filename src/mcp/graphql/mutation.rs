@@ -5,6 +5,7 @@ use async_graphql::{Context, Object, Result};
 use crate::models::EmailAddress;
 use crate::util::parse_addresses;
 
+use super::attachments::{self, AttachmentInput, GqlUploadedAttachment};
 use super::types::*;
 
 pub struct MutationRoot;
@@ -27,6 +28,9 @@ impl MutationRoot {
         #[graphql(desc = "HTML body content (alternative to plain text)")] html_body: Option<
             String,
         >,
+        #[graphql(desc = "Files to attach, as base64 or by blobId")] attachments: Option<
+            Vec<AttachmentInput>,
+        >,
         #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
         confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
@@ -34,15 +38,39 @@ impl MutationRoot {
         let cc_addrs = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
         let nonce_store = ctx.data::<super::types::NonceStore>()?;
-        let params = [to.as_str(), subject.as_str(), body.as_str()];
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
+        let mut client = client.lock().await;
+        let attachments = match attachments::resolve(
+            &client,
+            attachments.unwrap_or_default(),
+            matches!(action, SendAction::Preview),
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(msg) => return Ok(failed(msg)),
+        };
+        let attachment_keys = attachments::fingerprint(&attachments);
+        let mut params = vec![
+            to.as_str(),
+            subject.as_str(),
+            body.as_str(),
+            cc.as_deref().unwrap_or(""),
+            bcc.as_deref().unwrap_or(""),
+            from.as_deref().unwrap_or(""),
+            html_body.as_deref().unwrap_or(""),
+        ];
+        params.extend(attachment_keys.iter().map(String::as_str));
 
         if matches!(action, SendAction::Preview) {
             let nonce = super::types::issue_nonce(nonce_store, &params).await;
-            let mut preview =
-                format_send_preview(&to_addrs, &cc_addrs, &bcc_addrs, &subject, &body);
+            let mut body_preview = body.clone();
             if html_body.is_some() {
-                preview.push_str("\n[HTML body included]");
+                body_preview.push_str("\n[HTML body included]");
             }
+            body_preview.push_str(&attachments::preview(&attachments));
+            let preview =
+                format_send_preview(&to_addrs, &cc_addrs, &bcc_addrs, &subject, &body_preview);
             return Ok(GqlComposeResult {
                 success: true,
                 email_id: None,
@@ -65,9 +93,6 @@ impl MutationRoot {
         }
 
         let draft = matches!(action, SendAction::Draft);
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
-        let mut client = client.lock().await;
-
         match client
             .send_email(
                 to_addrs,
@@ -80,7 +105,7 @@ impl MutationRoot {
                     from: from.as_deref(),
                     draft,
                     html_body,
-                    attachments: vec![],
+                    attachments: attachments.into_iter().map(|a| a.data).collect(),
                 },
             )
             .await
@@ -117,16 +142,39 @@ impl MutationRoot {
         #[graphql(desc = "HTML body content (alternative to plain text)")] html_body: Option<
             String,
         >,
+        #[graphql(desc = "Files to attach, as base64 or by blobId")] attachments: Option<
+            Vec<AttachmentInput>,
+        >,
         #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
         confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
         let nonce_store = ctx.data::<super::types::NonceStore>()?;
-        let params = [email_id.as_str(), body.as_str()];
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let reply_all = all.unwrap_or(false);
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let mut client = client.lock().await;
+        let attachments = match attachments::resolve(
+            &client,
+            attachments.unwrap_or_default(),
+            matches!(action, SendAction::Preview),
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(msg) => return Ok(failed(msg)),
+        };
+        let attachment_keys = attachments::fingerprint(&attachments);
+        let mut params = vec![
+            email_id.as_str(),
+            body.as_str(),
+            if reply_all { "all" } else { "" },
+            cc.as_deref().unwrap_or(""),
+            bcc.as_deref().unwrap_or(""),
+            from.as_deref().unwrap_or(""),
+            html_body.as_deref().unwrap_or(""),
+        ];
+        params.extend(attachment_keys.iter().map(String::as_str));
 
         let original = client.get_email(&email_id, None, true).await?;
-        let reply_all = all.unwrap_or(false);
         let extra_cc = cc.as_deref().map(parse_addresses).unwrap_or_default();
         let bcc_addrs = bcc.as_deref().map(parse_addresses).unwrap_or_default();
 
@@ -180,6 +228,7 @@ impl MutationRoot {
             if html_body.is_some() {
                 preview.push_str("\n[HTML body included]");
             }
+            preview.push_str(&attachments::preview(&attachments));
             return Ok(GqlComposeResult {
                 success: true,
                 email_id: None,
@@ -213,7 +262,7 @@ impl MutationRoot {
                     from: from.as_deref(),
                     draft,
                     html_body,
-                    attachments: vec![],
+                    attachments: attachments.into_iter().map(|a| a.data).collect(),
                 },
             )
             .await
@@ -250,14 +299,37 @@ impl MutationRoot {
         #[graphql(desc = "HTML body content (alternative to plain text)")] html_body: Option<
             String,
         >,
+        #[graphql(desc = "Files to attach, as base64 or by blobId")] attachments: Option<
+            Vec<AttachmentInput>,
+        >,
         #[graphql(desc = "Token from PREVIEW response — required for CONFIRM/DRAFT")]
         confirmation_token: Option<String>,
     ) -> Result<GqlComposeResult> {
         let body_str = body.as_deref().unwrap_or("");
         let nonce_store = ctx.data::<super::types::NonceStore>()?;
-        let params = [email_id.as_str(), to.as_str(), body_str];
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let mut client = client.lock().await;
+        let attachments = match attachments::resolve(
+            &client,
+            attachments.unwrap_or_default(),
+            matches!(action, SendAction::Preview),
+        )
+        .await
+        {
+            Ok(a) => a,
+            Err(msg) => return Ok(failed(msg)),
+        };
+        let attachment_keys = attachments::fingerprint(&attachments);
+        let mut params = vec![
+            email_id.as_str(),
+            to.as_str(),
+            body_str,
+            cc.as_deref().unwrap_or(""),
+            bcc.as_deref().unwrap_or(""),
+            from.as_deref().unwrap_or(""),
+            html_body.as_deref().unwrap_or(""),
+        ];
+        params.extend(attachment_keys.iter().map(String::as_str));
 
         let original = client.get_email(&email_id, None, true).await?;
         let to_addrs = parse_addresses(&to);
@@ -276,7 +348,7 @@ impl MutationRoot {
 
         if matches!(action, SendAction::Preview) {
             let nonce = super::types::issue_nonce(nonce_store, &params).await;
-            let original_body = original.text_content().unwrap_or("");
+            let original_body = original.text_content().unwrap_or_default();
             let sender = format_addrs(&original.from.clone().unwrap_or_default());
 
             let mut preview = format!(
@@ -303,6 +375,7 @@ impl MutationRoot {
             if html_body.is_some() {
                 preview.push_str("\n[HTML body included]");
             }
+            preview.push_str(&attachments::preview(&attachments));
             return Ok(GqlComposeResult {
                 success: true,
                 email_id: None,
@@ -336,7 +409,7 @@ impl MutationRoot {
                     from: from.as_deref(),
                     draft,
                     html_body,
-                    attachments: vec![],
+                    attachments: attachments.into_iter().map(|a| a.data).collect(),
                 },
             )
             .await
@@ -358,6 +431,209 @@ impl MutationRoot {
         }
     }
 
+    /// Put a file on the server without sending anything, and return its
+    /// `blobId` to attach by. Saves repeating the base64 in both PREVIEW and
+    /// CONFIRM, and keeps each request small.
+    async fn upload_attachment(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "File name the recipient sees")] name: String,
+        #[graphql(desc = "MIME type; inferred from the name when omitted")] content_type: Option<
+            String,
+        >,
+        #[graphql(desc = "The file's bytes, base64-encoded")] base64: String,
+    ) -> Result<GqlUploadedAttachment> {
+        let (name, content_type) = attachments::name_and_type(name, content_type)?;
+        let bytes = attachments::decode(&name, &base64, attachments::MAX_ATTACHMENT_BYTES)?;
+        let size = bytes.len() as u64;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
+        let client = client.lock().await;
+        let blob_id = client.upload_blob(bytes, &content_type).await?;
+        Ok(GqlUploadedAttachment {
+            blob_id,
+            name,
+            content_type,
+            size,
+        })
+    }
+
+    /// Edit a saved draft. Only the fields given change; an empty string clears
+    /// to/cc/bcc. A new `body` replaces any HTML part unless `htmlBody` comes
+    /// with it. JMAP emails are immutable, so this saves an edited copy and
+    /// removes the original: the returned `emailId` is the draft's new ID, and
+    /// the old one stops resolving.
+    async fn update_draft(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "The draft's email ID")] email_id: String,
+        #[graphql(desc = "Recipients, comma-separated")] to: Option<String>,
+        #[graphql(desc = "CC recipients, comma-separated")] cc: Option<String>,
+        #[graphql(desc = "BCC recipients, comma-separated")] bcc: Option<String>,
+        #[graphql(desc = "Identity email address to send as")] from: Option<String>,
+        #[graphql(desc = "Subject line")] subject: Option<String>,
+        #[graphql(desc = "Plain-text body")] body: Option<String>,
+        #[graphql(desc = "HTML body")] html_body: Option<String>,
+        #[graphql(
+            desc = "Replaces the draft's attachments; pass an existing one's blobId to keep it"
+        )]
+        attachments: Option<Vec<AttachmentInput>>,
+    ) -> Result<GqlComposeResult> {
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
+        let client = client.lock().await;
+        let draft = client.get_email(&email_id, None, true).await?;
+        let attachments = match attachments {
+            Some(inputs) => match attachments::resolve(&client, inputs, true).await {
+                Ok(a) => Some(a.into_iter().map(|a| a.data).collect()),
+                Err(msg) => return Ok(failed(msg)),
+            },
+            None => None,
+        };
+
+        let edit = crate::jmap::DraftEdit {
+            to: to.as_deref().map(parse_addresses),
+            cc: cc.as_deref().map(parse_addresses),
+            bcc: bcc.as_deref().map(parse_addresses),
+            from,
+            subject,
+            body,
+            html_body,
+            attachments,
+        };
+        Ok(match client.replace_draft(&draft, edit).await {
+            Ok(id) => GqlComposeResult {
+                success: true,
+                email_id: Some(id),
+                preview: None,
+                confirmation_token: None,
+                error: None,
+            },
+            Err(e) => GqlComposeResult {
+                success: false,
+                email_id: None,
+                preview: None,
+                confirmation_token: None,
+                error: Some(e.to_string()),
+            },
+        })
+    }
+
+    /// Send a saved draft as it stands. ALWAYS use action=PREVIEW first, show the user, then CONFIRM with the confirmation_token.
+    async fn send_draft(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "PREVIEW first, then CONFIRM to send")] action: SendDraftAction,
+        #[graphql(desc = "The draft's email ID")] email_id: String,
+        #[graphql(desc = "Token from PREVIEW response — required for CONFIRM")]
+        confirmation_token: Option<String>,
+    ) -> Result<GqlComposeResult> {
+        let nonce_store = ctx.data::<super::types::NonceStore>()?;
+        // An email's content can't change under its ID, so the ID alone pins
+        // exactly what was previewed.
+        let params = ["send_draft", email_id.as_str()];
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
+        let mut client = client.lock().await;
+        let draft = client.get_email(&email_id, None, true).await?;
+
+        let failure = |msg: String| GqlComposeResult {
+            success: false,
+            email_id: None,
+            preview: None,
+            confirmation_token: None,
+            error: Some(msg),
+        };
+        if !draft.is_draft() {
+            return Ok(failure(format!("Email {email_id} is not a draft")));
+        }
+
+        if matches!(action, SendDraftAction::Preview) {
+            let nonce = super::types::issue_nonce(nonce_store, &params).await;
+            let mut preview = format!(
+                "DRAFT PREVIEW:\nFrom: {}\nTo: {}\nCC: {}\nBCC: {}\nSubject: {}\n\n--- Body ---\n{}",
+                format_addrs(draft.from.as_deref().unwrap_or_default()),
+                format_addrs(draft.to.as_deref().unwrap_or_default()),
+                format_addrs(draft.cc.as_deref().unwrap_or_default()),
+                format_addrs(draft.bcc.as_deref().unwrap_or_default()),
+                draft.subject.as_deref().unwrap_or(""),
+                draft.text_content().unwrap_or_default(),
+            );
+            let attachments: Vec<String> = draft
+                .attachments
+                .iter()
+                .flatten()
+                .map(|a| {
+                    format!(
+                        "{} ({})",
+                        a.name.as_deref().unwrap_or("(unnamed)"),
+                        attachments::human_size(a.size as usize)
+                    )
+                })
+                .collect();
+            if !attachments.is_empty() {
+                preview.push_str(&format!("\n\nAttachments: {}", attachments.join(", ")));
+            }
+            preview.push_str("\n\nTo send: use action=CONFIRM.");
+            return Ok(GqlComposeResult {
+                success: true,
+                email_id: None,
+                preview: Some(preview),
+                confirmation_token: Some(nonce),
+                error: None,
+            });
+        }
+
+        if let Err(msg) =
+            super::types::consume_nonce(nonce_store, confirmation_token.as_deref(), &params).await
+        {
+            return Ok(failure(msg.to_string()));
+        }
+
+        Ok(match client.send_draft(&draft).await {
+            Ok(()) => GqlComposeResult {
+                success: true,
+                email_id: Some(email_id),
+                preview: None,
+                confirmation_token: None,
+                error: None,
+            },
+            Err(e) => failure(e.to_string()),
+        })
+    }
+
+    /// Discard a draft by moving it to Trash, where it can still be recovered.
+    async fn delete_draft(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(desc = "The draft's email ID")] email_id: String,
+    ) -> Result<GqlStatus> {
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
+        let mut client = client.lock().await;
+        let draft = client.get_email(&email_id, None, true).await?;
+        if !draft.is_draft() {
+            return Ok(GqlStatus {
+                success: false,
+                message: None,
+                error: Some(format!("Email {email_id} is not a draft")),
+            });
+        }
+        let trash = client.find_mailbox("trash").await?;
+        Ok(match client.move_email(&email_id, &trash.id).await {
+            Ok(()) => GqlStatus {
+                success: true,
+                message: Some(format!(
+                    "Moved draft \"{}\" to {}",
+                    draft.subject.as_deref().unwrap_or("(no subject)"),
+                    trash.name
+                )),
+                error: None,
+            },
+            Err(e) => GqlStatus {
+                success: false,
+                message: None,
+                error: Some(e.to_string()),
+            },
+        })
+    }
+
     /// Move an email to a different mailbox/folder.
     async fn move_email(
         &self,
@@ -366,7 +642,7 @@ impl MutationRoot {
         #[graphql(desc = "Target mailbox name (e.g., 'Archive', 'Trash') or role")]
         target_mailbox: String,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let mut client = client.lock().await;
 
         let email = client.get_email(&email_id, None, true).await?;
@@ -399,7 +675,7 @@ impl MutationRoot {
             bool,
         >,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let client = client.lock().await;
         let read = read.unwrap_or(true);
 
@@ -438,7 +714,7 @@ impl MutationRoot {
         #[graphql(desc = "The email ID")] email_id: String,
         #[graphql(desc = "PREVIEW first, then CONFIRM")] action: SpamAction,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let mut client = client.lock().await;
 
         let email = client.get_email(&email_id, None, true).await?;
@@ -486,7 +762,7 @@ impl MutationRoot {
         #[graphql(desc = "A note to remember what this is for")] description: Option<String>,
         #[graphql(desc = "Custom prefix for the email address")] prefix: Option<String>,
     ) -> Result<GqlMaskedEmail> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let client = client.lock().await;
         let masked = client
             .create_masked_email(
@@ -504,7 +780,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         #[graphql(desc = "The masked email ID")] id: String,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let client = client.lock().await;
         match client
             .update_masked_email(&id, Some("enabled"), None, None)
@@ -529,7 +805,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         #[graphql(desc = "The masked email ID")] id: String,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let client = client.lock().await;
         match client
             .update_masked_email(&id, Some("disabled"), None, None)
@@ -554,7 +830,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         #[graphql(desc = "The masked email ID")] id: String,
     ) -> Result<GqlStatus> {
-        let client = ctx.data::<tokio::sync::Mutex<crate::jmap::JmapClient>>()?;
+        let client = ctx.data::<crate::mcp::graphql::SharedClient>()?;
         let client = client.lock().await;
         match client
             .update_masked_email(&id, Some("deleted"), None, None)
@@ -751,4 +1027,14 @@ fn format_send_preview(
         subject,
         body
     )
+}
+
+fn failed(msg: String) -> GqlComposeResult {
+    GqlComposeResult {
+        success: false,
+        email_id: None,
+        preview: None,
+        confirmation_token: None,
+        error: Some(msg),
+    }
 }
