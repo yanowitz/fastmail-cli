@@ -2,9 +2,489 @@
 
 ## [Unreleased]
 
+## [3.7.1] - 2026-10-13
+
+### Changed
+
+- **Inline attachments are fingerprinted with SHA-256**
+  ([#78](https://github.com/radiosilence/fastmail-cli/pull/78)). The confirmation token
+  keyed inline attachment bytes by the standard library's 64-bit hash, whose
+  fixed keys put a deliberate collision within reach of a client that chooses
+  the bytes. A CONFIRM could then have carried different content under the
+  same token.
+
+## [3.7.0] - 2026-10-13
+
+### Added
+
+- **Attachments over MCP**
+  ([#76](https://github.com/radiosilence/fastmail-cli/pull/76)). `sendEmail`, `replyToEmail`, `forwardEmail` and
+  `updateDraft` take `attachments: [AttachmentInput!]`, each one either inline
+  `base64` or the `blobId` of a blob already on the server. The server usually
+  runs remotely, so a client cannot name a local file the way `fastmail send -a`
+  does. `uploadAttachment` stores a file and returns its `blobId`, so the bytes
+  need not be sent with both PREVIEW and CONFIRM. The preview lists each
+  attachment's name, type and size, and the confirmation token covers them, so a
+  CONFIRM with different attachments is rejected. Attachments are capped at
+  25 MB per message.
+
+### Fixed
+
+- **Image attachments are sent with their image type.** The extension-based
+  MIME inference behind `fastmail send -a` knew documents only, so a PNG or JPEG
+  went out as `application/octet-stream` and mail clients showed it as a file
+  rather than an image.
+
+## [3.6.0] - 2026-09-29
+
+### Added
+
+- **Draft editing over MCP: `updateDraft`, `sendDraft`, `deleteDraft`**
+  ([#73](https://github.com/radiosilence/fastmail-cli/pull/73)). A
+  draft saved with `action: DRAFT` could not be changed, sent or discarded
+  afterwards. JMAP emails are immutable apart from keywords and mailboxes, so
+  `updateDraft` saves an edited copy and then destroys the original, in two
+  requests so that a failed create never loses the draft; the draft's ID
+  changes and the new one is returned. Fields not passed are carried over,
+  including threading headers and attachments (by blob, without re-uploading).
+  `sendDraft` follows the same PREVIEW → CONFIRM flow as `sendEmail` and files
+  the message in Sent on success. `deleteDraft` moves the draft to Trash rather
+  than destroying it.
+
+### Fixed
+
+- **CONFIRM tokens now cover every compose parameter**
+  ([#73](https://github.com/radiosilence/fastmail-cli/pull/73)). The token issued by
+  PREVIEW fingerprinted only `to`/`subject`/`body` (for replies, only the
+  email ID and body), so a CONFIRM could add `cc`/`bcc`, change `from` or the
+  HTML body, or turn a reply into reply-all without the user having seen it.
+  Any difference from the preview is now rejected.
+
+## [3.5.1] - 2026-09-29
+
+### Changed
+
+- **macOS release binaries are signed with a Developer ID and notarised.** Downloaded through a browser, the ad-hoc signed binaries were quarantined and Gatekeeper refused to run them until the quarantine attribute was cleared.
+
+### Fixed
+
+- **`reply` now prefers `Reply-To` over `From`**
+  ([#67](https://github.com/radiosilence/fastmail-cli/issues/67), reported by
+  Kendell). Transactional and support senders routinely put a branded address in
+  `From` and the inbox that actually receives mail in `Reply-To`; replying to
+  `From` then bounces off a domain with no MX record, which is how this was
+  found. `Reply-To` replaces `From` rather than joining it — on a reply-all the
+  branded address is no more deliverable than it was on a plain reply. An empty
+  `Reply-To` list is not a `Reply-To`, and still falls back.
+
+  The CLI and GraphQL's `replyToEmail` share the helper, so both were wrong
+  together and are fixed together — including the send preview, which had been
+  reporting the address it was about to fail to deliver to.
+
+## [3.5.0] - 2026-08-28
+
+### Added
+
+- **`fastmail watch`** ([#65](https://github.com/radiosilence/fastmail-cli/pull/65),
+  requested by [@davidcelis](https://github.com/davidcelis) in
+  [#64](https://github.com/radiosilence/fastmail-cli/issues/64)). Blocks and
+  emits one JSON object per line as mail arrives, so incoming email can drive a
+  shell loop instead of a cron job that re-lists the inbox and diffs it by hand. `--mailbox` narrows to one folder,
+  `--full` includes bodies, and `--poll <seconds>` swaps the push connection for
+  periodic checks where a long-lived one will not survive the network.
+
+  JMAP has offered the transport all along: the session advertises an
+  `eventSourceUrl` (RFC 8620 §7.3) that we parsed and threw away. The design
+  decision worth knowing is that push is only ever a wake-up. The `Email` state
+  cursor lives in the CLI, and every notification — or poll tick, or reconnect —
+  runs `Email/changes` against it, so all three paths converge on the same
+  answer and a lost notification costs latency rather than mail. When the server
+  has discarded history back past the cursor, the watcher resyncs and says so on
+  stderr rather than replaying the mailbox as new; stdout stays pure NDJSON
+  either way.
+
+  Only creations are reported. Reporting updates too would replay every flag
+  change and folder move as an arrival, which is not what a mail loop means by
+  "new".
+
+- **The `emails` GraphQL subscription**
+  ([#65](https://github.com/radiosilence/fastmail-cli/pull/65)), at
+  `/graphql/stream` over Server-Sent Events when the HTTP surface is up. Same
+  watcher as `fastmail watch`, so the cursor semantics are identical rather than
+  merely similar — the CLI and the subscription are two front ends on one
+  implementation, which is the only way they stay that way.
+
+  SSE rather than WebSockets: the subscription is a server-to-client firehose,
+  nothing is ever sent back up the socket, and SSE reconnects on its own.
+
+  MCP deliberately has none of this. Tools are request/response and a
+  subscription never returns, so the `graphql` tool's description says so and
+  points at the other two ways to get it.
+
+## [3.4.0] - 2026-08-17
+
+### Added
+
+- **`Session.carddavConfigured`.** Contacts go over CardDAV, which authenticates
+  with a username and an app password and rejects the API token everything else
+  uses — so `contacts` can fail on a connection where mail works perfectly.
+  `capabilities` could never report this: it lists what the JMAP server
+  advertises, and CardDAV is a separate protocol the handshake cannot see. The
+  only way to discover the gap was to run the query and fail, halfway through a
+  plan that assumed contacts were reachable. It reports whether both credentials
+  are present, not whether they work, and answers independently of `status`,
+  since they are resolved per request and stay knowable when the token is dead.
+  Both it and `contacts` read the same resolved value rather than loading the
+  config separately, so the flag cannot disagree with the operation it
+  describes.
+
+- **`X-Fastmail-Username` and `X-Fastmail-App-Password` headers.** CardDAV needs
+  its own credentials, so a hosted deployment could never offer contacts at all
+  — one bearer token cannot cover two protocols. They resolve exactly like
+  `X-Fastmail-Token`: the request's header first, local config after, each half
+  independently, so a header-supplied username is never silently completed with
+  the host's own password.
+
+### Changed
+
+- **The `graphql` tool describes everyday mail itself, so most sessions never
+  fetch the schema.** The SDL is ~27KB, most of it the doc comments that make it
+  worth reading, and it used to be the only way to learn anything — so reading
+  mail cost a 27KB fetch first, and cost it again whenever the connection
+  dropped. The tool description now carries a slimmed schema: the queries, the
+  `EmailFilter` tree, the common `Email` fields, the connection shape and the
+  PREVIEW→CONFIRM flow, plus worked examples. It names what it does *not* cover,
+  so the remaining cases know to ask rather than guess.
+
+- **`schema_sdl` takes a `types` list**, for those remaining cases:
+  `["MutationRoot"]` or `["Attachment", "MaskedEmail"]` is a few hundred bytes
+  rather than the lot. Definitions come back whole and documented; the types
+  they reference do not, so name those too. An unrecognised name is reported in
+  a trailing SDL comment with the names that do exist, rather than returning a
+  schema with a hole in it. Omitting `types` still returns everything, and a
+  client that sends no arguments at all is unaffected.
+
+  Both halves of that are held down by tests: the worked examples are scraped
+  out of the published tool descriptions and executed against the real schema,
+  and every field name in the inlined sketch must exist in it. A cheat sheet
+  that outlives a rename is worse than no cheat sheet — the first draft of this
+  one had already invented a `nonce` field and list-valued recipients.
+
+## [3.3.2] - 2026-07-26
+
+### Changed
+
+- **Build performance: thin LTO replaces fat LTO.** Fat LTO with a single codegen
+  unit serialises whole-program optimisation across the entire dependency tree —
+  every translation unit waits for the one before. This repo has a particularly
+  heavy tree (kreuzberg with bundled pdfium), so the build cost is significant.
+  The runtime benefit for an I/O-bound tool is not measurable. Thin LTO applies
+  optimisations per-module (parallelisable, cheaper) at a modest runtime cost
+  that never surfaces in wall time between requests. Build time drops from ~5
+  minutes to ~45 seconds on the first build; incremental rebuilds are similar.
+  Codegen units bumped to 16 (from 1) to parallelise optimisation.
+
+## [3.3.1] - 2026-07-26
+
+### Changed
+
+- **The container image is distroless — there is no shell in it any more.**
+  `docker run --entrypoint sh` and anything else that assumed a userland will
+  stop working; `gcr.io/distroless/cc-debian13:debug` carries busybox if you
+  need to get inside one. The image only ever needed to hold the binary, and
+  dropping the package manager and coreutils drops that whole surface with it.
+  It is not `scratch`, because three things rule that out: the system trust
+  store, which reqwest reads through rustls-native-certs; libstdc++ and a
+  dynamic loader, because pdfium is embedded and dlopened at runtime; and
+  `/tmp`, where pdfium is extracted on first use.
+
+### Added
+
+- **`linux-aarch64` binaries in the release assets.** The arm64 image needs one
+  built regardless, so publishing it costs nothing. Linux binaries are also
+  built against an older glibc than before, which widens the range of
+  distributions they run on.
+
+## [3.3.0] - 2026-07-26
+
+### Added
+
+- **`session` — is this token actually good?** Nothing on the graph answered
+  that. Every field needs auth, so a dead token surfaced as whatever error the
+  selected field happened to produce, and an empty result read the same as a
+  revoked credential. `session` re-runs the JMAP handshake rather than reporting
+  the cached one — clients are cached per token for the life of the process, so
+  a cached answer would keep claiming success long after a revocation — and
+  reports `CONNECTED` / `INVALID_CREDENTIALS` / `UNREACHABLE` as data rather
+  than raising an error: not being connected is the answer to this question, not
+  a failure to answer it. Only a 401 counts as a credential verdict; 5xx, rate
+  limiting and timeouts are `UNREACHABLE`, since a caller that can't tell an
+  outage from a revocation ends up telling users to re-authenticate through
+  someone else's downtime. `detail` carries the reason in prose for a tooltip;
+  the enum is what to branch on. When connected it also returns the username,
+  the accounts the token reaches and the capability URNs it was granted — the
+  only way to know whether masked email or submission are usable before trying
+  them. One API call, no mail touched. Matches `caldav-cli`'s `viewer`, minus
+  the rename: the field keeps its own name because that is what the gateway
+  already queries.
+
+### Fixed
+
+- **A stale `Cargo.lock` no longer reaches the image build.** `check` builds and
+  tests with `--locked`, so a lockfile that has drifted from `Cargo.toml` fails
+  in the pull request rather than in the Docker build, which was the only step
+  using `--locked` and so the only one that noticed.
+- **A version tag is never cut without an image behind it.** `publish` now waits
+  for the image builds as well as the tarballs. Previously they ran in parallel,
+  so a failed image build still produced a GitHub release with nothing to pull.
+
+## [3.2.1] - 2026-07-26
+
+### Changed
+
+- **Only `--http` mounts `/mcp` now.** The GraphQL surfaces bind the listener
+  because there is nowhere to mount an HTTP route over stdio, but they no longer
+  drag MCP onto it: the transport a model connects through and a browsable
+  endpoint for a human are separate things, and `fastmail mcp --browser` meaning
+  "open the IDE" should not also publish a JSON-RPC endpoint nobody asked for.
+  `--http` remains what a hosted deployment passes, so the Docker image is
+  unaffected. Anyone relying on `--graphql` alone to serve `/mcp` now needs both
+  flags. This matches `caldav-cli`, `tfl-mcp` and `mainlynorfolk-mcp`, where the
+  surfaces were already independent.
+
+## [3.2.0] - 2026-07-25
+
+### Changed
+
+- **The binary is now `fastmail`, not `fastmail-cli`.** The `-cli` suffix only
+  ever disambiguated the crate from the service; on the command line it was
+  noise you typed dozens of times a day. The package, repository and release
+  asset names are unchanged, so `cargo install` and the crates.io identity stay
+  put — only the installed executable is renamed. Two consequences: shell
+  completions must be regenerated, and `mise use -g github:radiosilence/fastmail-cli`
+  needs `[exe=fastmail]` appended, since ubi otherwise looks for a binary named
+  after the repository. The config directory stays at `~/.config/fastmail-cli/`
+  — nobody has to re-authenticate.
+
+## [3.1.3] - 2026-07-25
+
+### Changed
+
+- **`--graphql`, `--graphiql` and `--browser` no longer require `--http`.** They
+  cascade instead: `--browser` implies `--graphiql` implies `--graphql`, and any
+  of them starts the HTTP server on `127.0.0.1:8080`. The old `requires` chain
+  made you name a transport in order to ask for a surface that only exists on
+  that transport, when the address already had a default. `--http` now earns its
+  place only when you want a different address.
+
+## [3.1.2] - 2026-07-25
+
+### Fixed
+
+- **Stale query snippets in the schema's own documentation.** Making every
+  collection a connection invalidated the examples embedded in resolver doc
+  comments — `attachments { text }` had quietly become
+  `attachments { nodes { text } }` — and nothing compiles a doc comment, so they
+  went unnoticed. The snippets are gone rather than corrected: they restated
+  structure the SDL already describes, which is precisely why they could rot
+  without breaking anything. The prose that the SDL _cannot_ express — that
+  scalar filter fields AND together, that attachment payloads resolve lazily,
+  what each field costs — is what stays. A test now fails if the schema's prose
+  names a construct the schema no longer has.
+
+## [3.1.1] - 2026-07-25
+
+### Fixed
+
+- **The MCP server no longer caps every client to the 2024-11-05 protocol.** It
+  declared that version explicitly, and since rmcp negotiates down to the lower
+  of the two, the declared version acts as a ceiling — a client supporting
+  2025-11-25 was still held at the oldest revision, and anything added since was
+  ignored. No version is declared now, so rmcp offers the newest it implements
+  and negotiation picks the right one per client.
+
+### Added
+
+- **MCP instructions trimmed by 80%** — ~1,220 tokens to ~240. They had grown
+  into a tutorial with worked GraphQL examples, all of which duplicated what
+  `schema_sdl` already documents per field. Instructions ride in context for
+  every conversation the server is connected to, whether or not it gets used, so
+  what stays is only what the schema cannot say for itself: fetch the schema
+  first, ask in one nested query rather than looping, collections are
+  connections, and always preview before sending.
+
+- **Display titles on the MCP tools.** `graphql` and `schema_sdl` are what a
+  client shows in its UI, which reads as "Graphql" and "Schema sdl". They now
+  carry `title` — "Fastmail" and "Fastmail schema". Wire names are unchanged, so
+  existing prompts and configs keep working. (`title` is a 2025-06-18 field,
+  which the protocol cap above was suppressing.)
+
+## [3.1.0] - 2026-07-25
+
+### Added
+
+- **`--graphql` and `--graphiql` on `mcp --http`.** The HTTP server can now
+  mount a plain GraphQL-over-HTTP endpoint at `/graphql` and the GraphiQL IDE at
+  `/`, alongside MCP at `/mcp` on the same port, so the schema can be explored in
+  a browser rather than only through an LLM. `/mcp` speaks JSON-RPC, which a
+  browser doesn't, hence the separate endpoint. `--browser` opens the IDE once
+  the listener is bound. GraphiQL is loaded from a CDN with pinned versions and
+  SRI hashes; the page is an Askama template.
+- **`--http` now takes an optional address**, defaulting to `127.0.0.1:8080`.
+- **Every collection is a connection.** `mailboxes`, `identities`,
+  `maskedEmails`, `contacts`, `attachments`, `Mailbox.children` and
+  `Thread.emails` now take `first`/`last`/`after`/`before` and expose
+  `totalCount`, `pageInfo`, `edges` and `nodes`, with IDs for cursors. Only
+  `emails` pages server-side; the rest arrive whole from one call, so their
+  `totalCount` is free and a stale cursor errors rather than silently shifting
+  the page. `Thread.emails` returns the same `EmailConnection` as the query
+  does — `queryState` is null there, since a conversation is not a query.
+  Value lists (`from`, `to`, `cc`, `keywords`, `headers`, …) stay plain arrays:
+  they belong to the parent and paging them would be ceremony.
+- **`cid`, `charset` and `partId` on `Attachment`.** All three already arrived
+  with every full email fetch and were discarded. `cid` is the useful one:
+  inline images are referenced from the HTML body as `<img src="cid:...">`, so
+  without it there is no way to tell which attachment appears where.
+- **`Email.sender`** — RFC 5322 Sender, distinct from `From`, set when a message
+  was sent on the author's behalf. In the summary property set, so lists carry
+  it with no extra call.
+- **`Email.headers`** — every raw header in order, for the ones the typed fields
+  don't cover (`List-Unsubscribe`, `Received`, `Authentication-Results`). On the
+  full property set, so it resolves lazily and batched like the bodies.
+- **`Mailbox.myRights` and `Mailbox.isSubscribed`** — what the account may
+  actually do in a folder, so a move or flag change can be checked in advance
+  rather than failing at the write.
+- **Introspection over `/graphql` needs no Fastmail token.** A query whose
+  top-level selections are all introspection fields is answered from the schema
+  without authenticating or touching the network, so GraphiQL's docs,
+  autocomplete and explorer work before credentials do — otherwise a bad token
+  leaves you with an IDE that cannot describe the API you are trying to explore.
+  Anything selecting a real field, mixing introspection with real fields, or
+  hiding behind a fragment takes the normal authenticated path.
+
+### Changed
+
+- **`mcp --http` falls back to local credentials when a request sends no
+  `X-Fastmail-Token`.** Previously the HTTP transport had no fallback at all and
+  every request needed the header, which made running it locally awkward. The
+  header still wins where present, and the fallback is best-effort — a hosted
+  deployment ships no config or `FASTMAIL_API_TOKEN`, so it stays absent there
+  and per-request auth is unchanged. Note the consequence: binding a non-loopback
+  address on a machine that _does_ have credentials now serves them to anything
+  that can reach the port.
+
+- **Full nesting across the GraphQL graph.** Every logical edge is now
+  traversable, so a client can fetch emails, bodies and attachment content in a
+  single query instead of looping:
+  - `Query.mailbox(name:)` — look up one folder by name or role.
+  - `Mailbox.emails(limit:)`, `Mailbox.parent`, `Mailbox.children` — navigate
+    from a folder into its contents and around the folder tree.
+  - `Email.thread` — the whole conversation from any email.
+  - `Email.mailboxes` — the folders an email lives in, resolved from `mailboxIds`.
+  - `Thread.id`.
+- **DataLoader batching for every lazily-resolved field.** Bodies, attachment
+  metadata, threads, mailboxes and blob downloads are fetched through
+  request-scoped DataLoaders, so resolvers that run concurrently collapse into
+  one batched API call. Selecting `textBody` on a page of 25 emails costs one
+  extra `Email/get` rather than 25 — and repeating an ID within a query is free.
+  Attachment blobs, which have no batch endpoint, are downloaded concurrently
+  instead of one at a time.
+- **Query depth and complexity limits** (depth 15; nested lists priced by page
+  size). The graph now contains cycles by design, so unbounded queries are
+  rejected during validation, before any API call is made.
+
+- **Composable `EmailFilter`.** Filters are now a tree mirroring JMAP's
+  `FilterOperator` (RFC 8620 §5.5) instead of a flat argument list: scalar
+  fields on one filter are AND-ed, and `and` / `or` / `not` nest arbitrarily, so
+  a single query can express "unread, from either address, but not in Archive".
+  Mailbox names and roles are resolved to IDs at every depth of the tree in one
+  `Mailbox/get`. The same input type is accepted everywhere emails appear —
+  on `Mailbox.emails` it is AND-ed with the mailbox.
+- **Sorting** via `sort: [EmailSort!]`, over `receivedAt`, `sentAt`, `size`,
+  `subject`, `from` and `to`, with tie-breakers. Previously hardcoded to
+  newest-first.
+- **Relay connections with anchor-based pagination.** Email lists return
+  `EmailConnection` with `edges`/`nodes`, `pageInfo`, `totalCount`, `position`
+  and `queryState`. **Cursors are email IDs**, mapped onto JMAP's `anchor` /
+  `anchorOffset`: a positional cursor shifts every time mail arrives, so page 2
+  would re-show or skip messages, whereas an anchor names a specific message and
+  stays correct. They also stay legible for a model composing the follow-up
+  query — the cursor is an ID it has already seen. `last` without `before`
+  becomes a negative `position`, which JMAP counts from the end, so "the last N"
+  is one call and needs no total. A cursor whose email has been deleted or no
+  longer matches yields a clear "restart pagination" error rather than silently
+  wrong results. Page size is capped at 100; conflicting `first`+`last` or
+  `after`+`before` are rejected.
+- **The full JMAP filter and sort surface.** `EmailFilter` now mirrors
+  `FilterCondition` (RFC 8621 §4.4.1) field for field, adding
+  `inMailboxOtherThan`, `allInThreadHaveKeyword`, `someInThreadHaveKeyword`,
+  `noneInThreadHaveKeyword` and raw `header` matching. `EmailSort` adds the
+  keyword comparators (`hasKeyword`, `allInThreadHaveKeyword`,
+  `someInThreadHaveKeyword`) plus `collation`; comparators that require a
+  `keyword` — and those that reject one — are validated before any API call.
+- **Counts without fetching.** `totalCount` maps to JMAP's `calculateTotal`,
+  which costs the server real work, so it is requested only when the field is
+  selected. A query selecting _only_ `totalCount` issues one `Email/query` and
+  fetches no emails at all — `{ emails(filter: {unread: true}) { totalCount } }`
+  answers "how many?" without transferring a single message.
+- **`collapseThreads`** on every email list, for a conversation view.
+
+### Changed
+
+- **`emails` and `searchEmails` return `Email` instead of `EmailSummary`.**
+  `EmailSummary` was a dead end — reaching a body or an attachment meant a
+  separate `email(id:)` round trip per result. `Email` is a superset of its
+  fields under the same names, so existing queries are unaffected; the extra
+  fields simply resolve lazily now. The `EmailSummary` type is gone from the
+  schema.
+- **`emails(mailbox:, limit:)` is now `emails(filter:, sort:, first:, after:, …)`**
+  returning a connection. `searchEmails` is deprecated — it remains as a shim
+  that maps each of its flat arguments onto one leaf of an `EmailFilter`, and
+  also returns a connection.
+- List and search results now also carry `blobId`, `sentAt`, `bcc` and `replyTo`
+  without a second fetch.
+- `thread(emailId:)` returns emails with attachment metadata, which it
+  previously omitted.
+
+### Fixed
+
+- **List results now preserve the requested sort order.** `Email/get` makes no
+  ordering guarantee, but the results were returned in whatever order the server
+  sent them; they are now re-ordered to match the `Email/query` result. Affects
+  the `list` and `search` CLI commands as well as GraphQL.
+
+### Docs
+
+- README: comparison table against Fastmail's official MCP server — positions
+  `fastmail-cli` as the self-hosted CLI+MCP alternative (masked email,
+  attachment text extraction, spam training, self-custody) vs the hosted
+  official server (zero-setup, OAuth, and a wider suite: calendar, notes, org
+  directory).
+
+## [3.0.0] - 2026-07-24
+
+Hosted MCP: `fastmail-cli` can now run as a remote MCP backend behind an OAuth
+gateway ([`jaritanet-mcp-gateway`](https://github.com/radiosilence/jaritanet-mcp-gateway)),
+in addition to the unchanged local stdio mode.
+
+### Added
+
+- **Streamable HTTP transport for the MCP server** (`fastmail-cli mcp --http <addr>`): serves MCP at `/mcp` over HTTP instead of stdio, for remote/multi-tenant hosting. The Fastmail token is resolved **per request** from the `X-Fastmail-Token` header (set by a trusted upstream) rather than baked in at startup; stdio mode is unchanged and still uses the config/env token. Authenticated JMAP clients are cached per token. The raw HTTP transport trusts the header unconditionally and must sit behind an auth layer.
+- **Library crate**: the crate now exposes a `lib.rs` surface (JMAP client, GraphQL layer, MCP server) so a hosted service can link the machinery directly instead of shelling out to the binary. The CLI binary is unchanged.
+- **Container image** (`ghcr.io/radiosilence/fastmail-cli`): default command runs `mcp --http`, for use as a gateway backend. Multi-arch (amd64/arm64).
+
+### Fixed
+
+- **DNS-rebinding Host allowlist disabled in `--http` mode**: rmcp's streamable-HTTP server rejects a proxied `Host` (e.g. an internal service name) with `403 Forbidden: Host header is not allowed`. Rebinding protection guards browsers hitting a localhost MCP directly — irrelevant for a proxied, non-browser-facing backend where the proxy is the security boundary — so it's disabled for this transport.
+
 ### Changed
 
 - Dependency updates via `cargo update` (Cargo.lock only).
+
+### Note
+
+Bumped to a major version because the MCP server gained a new transport and a
+public library surface; the stdio CLI behaviour is backward-compatible.
 
 ## [2.2.2] - 2026-04-18
 

@@ -1,17 +1,8 @@
-mod carddav;
-mod commands;
-mod config;
-mod error;
-mod jmap;
-mod mcp;
-mod models;
-mod projection;
-pub mod util;
-
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use models::Output;
-use projection::Projection;
+use fastmail_cli::models::Output;
+use fastmail_cli::projection::Projection;
+use fastmail_cli::{commands, jmap, mcp, util};
 use std::io;
 use tracing_subscriber::EnvFilter;
 
@@ -24,6 +15,8 @@ fn resolve_projection(compact: bool, fields: Option<&str>) -> anyhow::Result<Pro
         (false, None) => Ok(Projection::Full),
     }
 }
+
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
 
 /// Build ComposeParams with resolved HTML and loaded attachments.
 fn build_compose_params<'a>(
@@ -51,7 +44,7 @@ fn build_compose_params<'a>(
 }
 
 #[derive(Parser)]
-#[command(name = "fastmail-cli")]
+#[command(name = "fastmail")]
 #[command(version, about = "CLI for Fastmail's JMAP API", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -76,6 +69,10 @@ enum Commands {
         /// Email ID
         email_id: String,
 
+        /// Return only the email ID and ordered raw header fields
+        #[arg(long, conflicts_with_all = ["compact", "fields"])]
+        headers: bool,
+
         /// Agent-friendly compact output: flattened plain-text body,
         /// summarized attachments, derived `unread`/`flagged` bools, JMAP
         /// internals dropped.
@@ -87,6 +84,21 @@ enum Commands {
         /// bandwidth in addition to output bytes.
         #[arg(long, conflicts_with = "compact")]
         fields: Option<String>,
+    },
+
+    /// Stream newly arrived emails as newline-delimited JSON, until interrupted
+    Watch {
+        /// Only report mail landing in this mailbox (name or role)
+        #[arg(short, long)]
+        mailbox: Option<String>,
+
+        /// Include bodies and attachment metadata, not just summaries
+        #[arg(long)]
+        full: bool,
+
+        /// Check every N seconds instead of holding a push connection open
+        #[arg(long, value_name = "SECONDS")]
+        poll: Option<u64>,
     },
 
     /// Get all emails in a thread/conversation
@@ -213,7 +225,7 @@ enum Commands {
         #[arg(long)]
         bcc: Option<String>,
 
-        /// In-Reply-To message ID (for threading)
+        /// Message ID for threading: sets In-Reply-To and References
         #[arg(long)]
         reply_to: Option<String>,
 
@@ -386,7 +398,32 @@ enum Commands {
     Contacts(ContactsCommands),
 
     /// Run as MCP (Model Context Protocol) server for Claude integration
-    Mcp,
+    Mcp {
+        /// Serve MCP over streamable HTTP at /mcp instead of stdio, on this
+        /// address (default 127.0.0.1:8080). The `X-Fastmail-Token` header
+        /// overrides the configured token per request, which is how a hosted
+        /// deployment serves many users.
+        #[arg(
+            long,
+            value_name = "ADDR",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_HTTP_ADDR,
+        )]
+        http: Option<String>,
+
+        /// Serve plain GraphQL-over-HTTP at /graphql
+        #[arg(long)]
+        graphql: bool,
+
+        /// Serve the GraphiQL IDE at /, and the /graphql it talks to
+        #[arg(long)]
+        graphiql: bool,
+
+        /// Open the GraphiQL IDE in your browser once listening (implies
+        /// --graphiql)
+        #[arg(long)]
+        browser: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -582,9 +619,17 @@ async fn main() {
 
         Commands::Get {
             email_id,
+            headers,
             compact,
             fields,
-        } => match resolve_projection(compact, fields.as_deref()) {
+        } => match resolve_projection(
+            compact,
+            if headers {
+                Some("id,headers")
+            } else {
+                fields.as_deref()
+            },
+        ) {
             Ok(proj) => commands::get_email(&email_id, proj).await,
             Err(e) => Err(e),
         },
@@ -597,6 +642,19 @@ async fn main() {
             Ok(proj) => commands::get_thread(&email_id, proj).await,
             Err(e) => Err(e),
         },
+
+        Commands::Watch {
+            mailbox,
+            full,
+            poll,
+        } => {
+            commands::watch(commands::WatchOptions {
+                mailbox,
+                full,
+                poll,
+            })
+            .await
+        }
 
         Commands::Search {
             text,
@@ -757,12 +815,7 @@ async fn main() {
         }
 
         Commands::Completions { shell } => {
-            generate(
-                shell,
-                &mut Cli::command(),
-                "fastmail-cli",
-                &mut io::stdout(),
-            );
+            generate(shell, &mut Cli::command(), "fastmail", &mut io::stdout());
             return;
         }
 
@@ -841,11 +894,45 @@ async fn main() {
             }
         },
 
-        Commands::Mcp => mcp::run_server().await,
+        Commands::Mcp {
+            http,
+            graphql,
+            graphiql,
+            browser,
+        } => {
+            let graphiql = graphiql || browser;
+            let surfaces = mcp::HttpSurfaces {
+                graphql: graphql || graphiql,
+                graphiql,
+                browser,
+            };
+            // Any HTTP-only surface implies the HTTP transport, at its default address.
+            let addr = http.or_else(|| (surfaces.graphql).then(|| DEFAULT_HTTP_ADDR.to_string()));
+            match addr {
+                Some(addr) => mcp::run_http_server(&addr, surfaces).await,
+                None => mcp::run_server().await,
+            }
+        }
     };
 
     if let Err(e) = result {
         Output::<()>::error(e.to_string()).print();
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_headers_conflicts_with_other_projections() {
+        assert!(Cli::try_parse_from(["fastmail", "get", "e1", "--headers"]).is_ok());
+        for flags in [vec!["--compact"], vec!["--fields", "id,headers"]] {
+            let mut args = vec!["fastmail", "get", "e1", "--headers"];
+            args.extend(flags);
+            let error = Cli::try_parse_from(args).err().unwrap();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 }

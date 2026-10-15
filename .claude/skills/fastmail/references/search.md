@@ -1,4 +1,4 @@
-# fastmail-cli — Search
+# fastmail — Search
 
 Filters are ANDed. Output is `{success, data: [emails...]}`. For the `--compact` vs `--fields` distinction, see `SKILL.md`.
 
@@ -20,27 +20,27 @@ Filters are ANDed. Output is `{success, data: [emails...]}`. For the `--compact`
 ## Examples
 
 ```bash
-fastmail-cli search --text "invoice"
-fastmail-cli search --from boss@company.com --unread --compact
-fastmail-cli search --subject "deployment" --mailbox "Work" --compact
-fastmail-cli search --after 2024-01-01 --before 2024-02-01 -l 100 --compact
-fastmail-cli search --has-attachment --min-size 1048576 --compact
+fastmail search --text "invoice"
+fastmail search --from boss@company.com --unread --compact
+fastmail search --subject "deployment" --mailbox "Work" --compact
+fastmail search --after 2024-01-01 --before 2024-02-01 -l 100 --compact
+fastmail search --has-attachment --min-size 1048576 --compact
 
 # Bulk triage: minimal fields, larger limit
-fastmail-cli search --from newsletter@ --before 2024-01-01 -l 200 \
+fastmail search --from newsletter@ --before 2024-01-01 -l 200 \
   --fields id,from,subject,receivedAt,size
 
 # Bulk action: loop ids into another command
-for id in $(fastmail-cli search --from newsletter@ --before 2024-01-01 --fields id | jq -r '.data[].id'); do
-  fastmail-cli move "$id" --to Archive
+for id in $(fastmail search --from newsletter@ --before 2024-01-01 --fields id | jq -r '.data[].id'); do
+  fastmail move "$id" --to Archive
 done
 
 # Page through a large result set
-fastmail-cli search --mailbox Archive -l 100 --offset 100 --fields id,subject
+fastmail search --mailbox Archive -l 100 --offset 100 --fields id,subject
 
 # Read context: narrow, then pull full thread
-fastmail-cli search --subject "Project Kickoff" --from alice@ --compact
-fastmail-cli thread EMAIL_ID --compact
+fastmail search --subject "Project Kickoff" --from alice@ --compact
+fastmail thread EMAIL_ID --compact
 ```
 
 Prefer field-targeted flags over `--text` when you know which field to hit — faster and more precise.

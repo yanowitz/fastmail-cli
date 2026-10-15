@@ -1,4 +1,4 @@
-# fastmail-cli — Contacts
+# fastmail — Contacts
 
 CardDAV. Needs separate credentials from the JMAP token:
 
@@ -14,12 +14,12 @@ Or `FASTMAIL_USERNAME` + `FASTMAIL_APP_PASSWORD`. App passwords: Fastmail Settin
 ## Commands
 
 ```bash
-fastmail-cli contacts list
-fastmail-cli contacts search QUERY    # matches name, email, or organization
+fastmail contacts list
+fastmail contacts search QUERY    # matches name, email, or organization
 
-fastmail-cli contacts create --name NAME [--email A,B] [--phone P] [--organization ORG] [--title T] [--notes N]
-fastmail-cli contacts update CONTACT_ID [--name] [--email] [--phone] [--organization] [--title] [--notes]
-fastmail-cli contacts delete CONTACT_ID [-y]
+fastmail contacts create --name NAME [--email A,B] [--phone P] [--organization ORG] [--title T] [--notes N]
+fastmail contacts update CONTACT_ID [--name] [--email] [--phone] [--organization] [--title] [--notes]
+fastmail contacts delete CONTACT_ID [-y]
 ```
 
 - `create` requires `--name`; `--email`/`--phone` take comma-separated lists.
@@ -30,13 +30,13 @@ fastmail-cli contacts delete CONTACT_ID [-y]
 
 ```bash
 # Find email before composing
-fastmail-cli contacts search "Bob Smith" | jq '.data[0].emails[0].value'
+fastmail contacts search "Bob Smith" | jq '.data[0].emails[0].value'
 
 # Verify unknown sender
-fastmail-cli contacts search "bob@unknown.com"
+fastmail contacts search "bob@unknown.com"
 
 # All contacts at a company
-fastmail-cli contacts search "bigcorp.com"
+fastmail contacts search "bigcorp.com"
 ```
 
 ## Notes

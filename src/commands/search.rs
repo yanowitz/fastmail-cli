@@ -61,11 +61,13 @@ pub async fn search(
     let page = client
         .search_emails_filtered(&filter, mailbox_id.as_deref(), limit, offset, props_slice)
         .await?;
-    let returned = page.emails.len() as u32;
-    let truncated = page.total > offset.saturating_add(returned);
-    Output::success(project_many(page.emails, &projection))
-        .with_total(page.total, truncated)
-        .print();
+    let returned = page.emails.len() as u64;
+
+    let mut output = Output::success(project_many(page.emails, &projection));
+    if let Some(total) = page.total {
+        output = output.with_total(total, total > u64::from(offset) + returned);
+    }
+    output.print();
 
     Ok(())
 }

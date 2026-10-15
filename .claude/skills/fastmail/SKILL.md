@@ -3,7 +3,7 @@ name: fastmail
 description: Use when the user mentions Fastmail, fastmail-cli, or needs to send, search, read, reply, forward, or triage email from the CLI. Also covers Fastmail contacts (CardDAV), masked email addresses, and email attachments.
 ---
 
-# fastmail-cli
+# fastmail
 
 Rust CLI for Fastmail via JMAP (email) and CardDAV (contacts). Output is JSON: `{"success": bool, "data": ..., "error"?, "message"?}`.
 
@@ -15,7 +15,7 @@ Rust CLI for Fastmail via JMAP (email) and CardDAV (contacts). Output is JSON: `
 ## Setup
 
 ```bash
-fastmail-cli auth          # reads the fmu1-… token from stdin (paste, then Ctrl-D)
+fastmail auth          # reads the fmu1-… token from stdin (paste, then Ctrl-D)
 ```
 
 Pass the token via stdin, not as an argument — a bare `auth fmu1-…` leaks the token to `ps`, shell history, and the process environment.
@@ -41,28 +41,28 @@ Default JMAP responses are verbose. `search`, `list emails`, `get`, and `thread`
 ## Commands
 
 ```bash
-fastmail-cli list emails [-m MAILBOX] [-l LIMIT] [--compact | --fields CSV]    # default INBOX/50
-fastmail-cli list mailboxes
-fastmail-cli list identities                                                    # aliases for --from
+fastmail list emails [-m MAILBOX] [-l LIMIT] [--compact | --fields CSV]    # default INBOX/50
+fastmail list mailboxes
+fastmail list identities                                                    # aliases for --from
 
-fastmail-cli get EMAIL_ID [--compact | --fields CSV]
-fastmail-cli thread EMAIL_ID [--compact | --fields CSV]
+fastmail get EMAIL_ID [--compact | --fields CSV | --headers]
+fastmail thread EMAIL_ID [--compact | --fields CSV]
 
-fastmail-cli search [FILTERS] [--compact | --fields CSV] [-l LIMIT] [--offset N]
+fastmail search [FILTERS] [--compact | --fields CSV] [-l LIMIT] [--offset N]
 
 # send/reply/forward also take: --html-body HTML | --html-file PATH, -a/--attachment FILE (repeatable)
-fastmail-cli send --to ADDR --subject S --body B [--cc] [--bcc] [--from IDENT] [--reply-to MSG_ID] [--draft]
-fastmail-cli reply EMAIL_ID --body B [--all] [--cc] [--bcc] [--from] [--draft]
-fastmail-cli forward EMAIL_ID --to ADDR [--body] [--cc] [--bcc] [--from] [--draft]
+fastmail send --to ADDR --subject S --body B [--cc] [--bcc] [--from IDENT] [--reply-to MSG_ID] [--draft]
+fastmail reply EMAIL_ID --body B [--all] [--cc] [--bcc] [--from] [--draft]
+fastmail forward EMAIL_ID --to ADDR [--body] [--cc] [--bcc] [--from] [--draft]
 
-fastmail-cli move EMAIL_ID --to MAILBOX
-fastmail-cli mark-read EMAIL_ID [--unread]
-fastmail-cli spam EMAIL_ID [-y]
+fastmail move EMAIL_ID --to MAILBOX
+fastmail mark-read EMAIL_ID [--unread]
+fastmail spam EMAIL_ID [-y]
 
-fastmail-cli download EMAIL_ID [-o DIR] [-f raw|json] [--max-size 1M]
+fastmail download EMAIL_ID [-o DIR] [-f raw|json] [--max-size 1M]
 
-fastmail-cli masked list|create|enable|disable|delete ...
-fastmail-cli contacts list|search QUERY|create|update|delete ...   # create/update/delete write via CardDAV
+fastmail masked list|create|enable|disable|delete ...
+fastmail contacts list|search QUERY|create|update|delete ...   # create/update/delete write via CardDAV
 ```
 
 **Search filters** (all ANDed): `--text/-t`, `--from`, `--to`, `--cc`, `--bcc`, `--subject`, `--body`, `--mailbox/-m`, `--before`, `--after` (ISO 8601), `--unread`, `--flagged`, `--has-attachment`, `--min-size`, `--max-size`.
@@ -74,8 +74,8 @@ fastmail-cli contacts list|search QUERY|create|update|delete ...   # create/upda
 `jq` is only needed to feed a value into the next shell command. For inspection, just read the JSON. When piping, pair `--fields id` with `jq -r`:
 
 ```bash
-fastmail-cli reply \
-  $(fastmail-cli search --from boss@ --unread --fields id | jq -r '.data[0].id') \
+fastmail reply \
+  $(fastmail search --from boss@ --unread --fields id | jq -r '.data[0].id') \
   --body "On it."
 ```
 

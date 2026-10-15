@@ -1,99 +1,277 @@
 name: CI/CD
 
+# Doc-only changes don't need the build/test/release pipeline — skip it when a
+# push/PR touches nothing but Markdown or the licence.
 on:
   push:
     branches: [main]
+    paths-ignore: ["**/*.md", "LICENSE"]
   pull_request:
     branches: [main]
+    paths-ignore: ["**/*.md", "LICENSE"]
+  # GitHub evicts any cache not read for 7 days, and this repo goes quiet for
+  # longer than that between bursts of work. The first push back then compiles
+  # ~200 crates from cold on every runner, which is the slow build people
+  # actually notice. Building twice a week on main keeps the entries alive and
+  # re-saves them against the current Cargo.lock, so the cost lands on a
+  # schedule rather than on whoever opens the next pull request.
+  schedule:
+    - cron: "0 6 * * 1,4"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # radiosilence/fastmail-cli
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    name: Check
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Branch-scoped caches aren't readable from other branches, so a PR
+          # saving here only evicts the main entry every PR restores from.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check formatting
         run: cargo fmt -- --check
+      # --all-targets so the tests are linted too, which the bare invocation
+      # skipped. No separate `cargo build`: `cargo test` compiles the binary as
+      # well, so it only bought a second pass over the same crates.
       - name: Clippy
-        run: cargo clippy -- -D warnings
-      - name: Build
-        run: cargo build --verbose
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --locked
 
-  release:
-    needs: check
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+  # Is Cargo.toml's version ahead of what's actually been shipped? Releases are
+  # the source of truth, not tags: a tag can exist without a release, or be left
+  # behind by a run that failed after tagging, and either would suppress the
+  # release forever. Releases are also what consumers and update pollers read.
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
     permissions:
-      contents: write
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: linux-x86_64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: darwin-x86_64
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: darwin-aarch64
-    runs-on: ${{ matrix.os }}
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      is_new: ${{ steps.v.outputs.is_new }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Package
-        run: |
-          cd target/${{ matrix.target }}/release
-          tar -czvf ../../../fastmail-cli-${{ matrix.name }}.tar.gz fastmail-cli
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: fastmail-cli-${{ matrix.name }}
-          path: fastmail-cli-${{ matrix.name }}.tar.gz
-
-  publish:
-    needs: release
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 0
-      - name: Get version
-        id: version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          LATEST=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "tag=v$VERSION" >> $GITHUB_OUTPUT
-      - name: Check if tag exists
-        id: check_tag
-        run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+          if [ "v$VERSION" = "$LATEST" ]; then
+            echo "is_new=false" >> $GITHUB_OUTPUT
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "is_new=true" >> $GITHUB_OUTPUT
           fi
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: steps.check_tag.outputs.exists == 'false'
+          echo "Cargo.toml v$VERSION, latest release ${LATEST:-none}"
+
+  # One job, one compile, two outputs: this owns the Linux release build and
+  # feeds the same binary straight into the Docker build. Splitting them would
+  # cost a runner handoff and an artifact round-trip, and upload-artifact drops
+  # the executable bit on the way through.
+  #
+  # Runs on pull requests: nothing else builds the image, so a broken Dockerfile
+  # used to surface only after merge. Pushes nothing either way.
+  #
+  # The runner is pinned rather than ubuntu-latest, and that is load-bearing:
+  # this binary is copied into a distroless image, and glibc symbol versioning
+  # is forward-compatible only, so building against a newer glibc than the base
+  # links fine and dies at exec time. cc-debian13 is 2.41, which makes 24.04
+  # (2.39) the newest usable runner — 25.10 is 2.42 and 26.04 is 2.43. A
+  # floating ubuntu-latest would break the image the day it rolls over.
+  build-image:
+    name: Build ${{ matrix.arch }} Image
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A transient failure on one arch shouldn't cancel the other.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            name: linux-x86_64
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            name: linux-aarch64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.name }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends clang cmake pkg-config
+      - name: Build
+        run: cargo build --release --locked
+      - name: Stage binary
+        run: mkdir -p dist && cp target/release/fastmail dist/fastmail
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      # No gha layer cache: nothing compiles in the image now, and mode=max was
+      # stuffing Rust build layers into the same repo-wide 10GB budget
+      # Swatinem/rust-cache uses, so the two evicted each other.
+      - name: Build ${{ matrix.arch }} image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          build-args: BIN_SOURCE=prebuilt
+          # Baked into the tarball, so publish pushes what it loads untouched.
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ matrix.arch }}
+          outputs: type=docker,dest=/tmp/image-${{ matrix.arch }}.tar
+      - name: Smoke test
+        run: |
+          docker load -i /tmp/image-${{ matrix.arch }}.tar
+          docker run --rm ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-${{ matrix.arch }} --version
+      - name: Package binary
+        run: tar -czvf fastmail-cli-${{ matrix.name }}.tar.gz -C dist fastmail
+      # A scheduled run compiles only to refresh the cache, so it has no reason
+      # to leave a 90-day artefact behind twice a week.
+      - name: Upload binary
+        if: github.event_name != 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.name }}
+          path: fastmail-cli-${{ matrix.name }}.tar.gz
+      - name: Upload image
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.arch }}
+          path: /tmp/image-${{ matrix.arch }}.tar
+          # Only publish reads these, minutes later.
+          retention-days: 1
+
+  # Release assets only — no image consumes these, so they'd be dead weight on a
+  # pull request. Runs on the schedule regardless, because these are the only
+  # macOS caches in the pipeline and they are wanted warm precisely when a
+  # release goes out, which is rare enough that they would otherwise always have
+  # expired by then.
+  build-darwin:
+    name: Build ${{ matrix.name }}
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            name: darwin-x86_64
+          - target: aarch64-apple-darwin
+            name: darwin-aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      # Developer ID signed and notarised, so the tarball runs from a browser
+      # download without clearing quarantine. Pull requests stay ad-hoc signed.
+      - name: Sign and notarise (macOS)
+        if: runner.os == 'macOS' && github.event_name != 'schedule'
+        uses: radiosilence/blit-workflows/macos-notarise@c8a650dfa5a0fbe012c61eab28f615c1983aee18
+        with:
+          binaries: |
+            target/${{ matrix.target }}/release/fastmail
+          certificate-p12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          api-key-p8: ${{ secrets.APPLE_API_KEY_P8 }}
+          api-key-id: ${{ secrets.APPLE_API_KEY_ID }}
+          api-issuer-id: ${{ secrets.APPLE_API_ISSUER_ID }}
+      - name: Package
+        run: tar -czvf fastmail-cli-${{ matrix.name }}.tar.gz -C target/${{ matrix.target }}/release fastmail
+      - name: Upload binary
+        if: github.event_name != 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.name }}
+          path: fastmail-cli-${{ matrix.name }}.tar.gz
+
+  # The only job that publishes anything, and the release is its last step. This
+  # project is consumed as a container, so a version tag with no image behind it
+  # is worse than no tag at all — an auto-updater polling releases will happily
+  # pin one. Images go up first; the release announces them.
+  publish:
+    name: Publish
+    needs: [check, version, build-image, build-darwin]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-*
+          path: /tmp/images
+          merge-multiple: true
+      - uses: docker/login-action@06fb636fac595d6fb4b28a5dfcb21a6f5091859c # v4.5.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Loading an arm64 image on an amd64 runner is fine — it is stored and
+      # pushed here, never executed.
+      - name: Push arch images
+        run: |
+          for arch in amd64 arm64; do
+            docker load -i /tmp/images/image-$arch.tar
+            docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-$arch
+          done
+      - name: Create :main and :sha-<short> manifests
+        run: |
+          for tag in main "sha-$(echo ${{ github.sha }} | cut -c1-7)"; do
+            docker buildx imagetools create \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-arm64
+          done
+      - name: Create semver manifests
+        if: needs.version.outputs.is_new == 'true'
+        run: |
+          VERSION=${{ needs.version.outputs.version }}
+          for tag in "v$VERSION" "v$(echo $VERSION | cut -d. -f1,2)" "v$(echo $VERSION | cut -d. -f1)" latest; do
+            docker buildx imagetools create \
+              --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:$tag \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-amd64 \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main-arm64
+          done
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.version.outputs.is_new == 'true'
+        with:
+          pattern: bin-*
           path: artifacts
+          merge-multiple: true
       - name: Create Release
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        if: needs.version.outputs.is_new == 'true'
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          files: artifacts/**/*.tar.gz
+          tag_name: ${{ needs.version.outputs.tag }}
+          name: ${{ needs.version.outputs.tag }}
+          files: artifacts/*.tar.gz
           generate_release_notes: true
